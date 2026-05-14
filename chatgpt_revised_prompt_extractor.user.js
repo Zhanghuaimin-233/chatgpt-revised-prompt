@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 图片生成优化提示词提取器
 // @namespace    https://github.com/kadevin/chatgpt-revised-prompt
-// @version      5.0.0
-// @description  提取 ChatGPT 图片生成优化提示词，支持缩略图预览、多选批量下载
+// @version      5.1.0
+// @description  手动提取 ChatGPT 图片生成优化提示词，支持缩略图预览、多选批量下载
 // @author       iLab
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -62,6 +62,7 @@ const seenPrompts = new Set();
 let lastFetchTime = 0; // 请求节流
 let lastFetchConvId = ''; // 避免重复请求同一对话
 const FETCH_COOLDOWN = 5000; // 最小请求间隔 5 秒
+let isFetchingPrompts = false;
 
 function injectStyles() {
     if (document.getElementById('rp-styles')) return;
@@ -90,6 +91,10 @@ html.dark .rp-hdr{border-bottom-color:rgba(255,255,255,.06);color:#e5e5e5}
 .rp-sel-all{font-size:11px;padding:3px 8px;border:1px solid rgba(16,163,127,.3);border-radius:5px;
     background:none;color:#10a37f;cursor:pointer;font-family:inherit}
 .rp-sel-all:hover{background:rgba(16,163,127,.07)}
+.rp-refresh{font-size:11px;padding:3px 8px;border:1px solid rgba(16,163,127,.3);border-radius:5px;
+    background:#10a37f;color:#fff;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:4px}
+.rp-refresh:hover{background:#0d8a6b}
+.rp-refresh:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed}
 .rp-count-badge{font-size:11px;font-weight:500;color:#6e6e80;background:rgba(0,0,0,.05);
     padding:2px 8px;border-radius:10px}
 html.dark .rp-count-badge{background:rgba(255,255,255,.08);color:#9ca3af}
@@ -187,6 +192,7 @@ const SVG = {
     arrow: `<svg class="rp-arrow" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>`,
     copy: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`,
     check: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
+    refresh: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/></svg>`,
     download: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
     img: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity=".3"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`,
 };
@@ -209,10 +215,16 @@ function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replac
 function createFab() {
     if (document.getElementById('rp-fab')) return;
     const fab = document.createElement('button');
-    fab.id = 'rp-fab'; fab.title = '查看图片优化提示词';
+    fab.id = 'rp-fab'; fab.title = '手动提取图片优化提示词';
     fab.innerHTML = SVG.brush;
-    fab.style.display = 'none';
-    fab.onclick = () => { const p = document.getElementById('rp-panel'); if(p) p.classList.toggle('open'); };
+    fab.style.display = getConversationId() ? 'flex' : 'none';
+    fab.onclick = async () => {
+        const p = document.getElementById('rp-panel');
+        const wasOpen = p?.classList.contains('open');
+        if (p) p.classList.toggle('open');
+        if (wasOpen) return;
+        await manualFetchPrompts();
+    };
     document.body.appendChild(fab);
 }
 
@@ -225,6 +237,7 @@ function createPanel() {
             ${SVG.brush.replace('width="20" height="20"','width="16" height="16"')}
             <span>优化提示词</span>
             <div class="rp-hdr-right">
+                <button class="rp-refresh" id="rp-refresh">${SVG.refresh} 提取</button>
                 <button class="rp-sel-all" id="rp-sel-all">全选</button>
                 <span class="rp-count-badge" id="rp-count">0</span>
             </div>
@@ -236,6 +249,7 @@ function createPanel() {
         </div>`;
     document.body.appendChild(panel);
 
+    document.getElementById('rp-refresh').onclick = manualFetchPrompts;
     document.getElementById('rp-sel-all').onclick = toggleSelectAll;
     document.getElementById('rp-dl-sel').onclick = downloadSelected;
     document.getElementById('rp-dl-all').onclick = downloadAll;
@@ -245,7 +259,7 @@ function updateFab() {
     const fab = document.getElementById('rp-fab');
     if (!fab) return;
     const total = allRounds.reduce((s,r) => s + r.prompts.length, 0);
-    fab.style.display = total > 0 ? 'flex' : 'none';
+    fab.style.display = getConversationId() ? 'flex' : 'none';
     const old = fab.querySelector('.rp-badge'); if (old) old.remove();
     if (total > 0) {
         const b = document.createElement('span'); b.className = 'rp-badge'; b.textContent = total;
@@ -829,9 +843,8 @@ async function fetchAndExtractPrompts(forceRefresh) {
 
         // 限流处理
         if (resp.status === 429) {
-            log('⚠️ 请求被限流，60秒后重试');
-            showStatus('请求太频繁，稍后重试...');
-            setTimeout(() => fetchAndExtractPrompts(true), 60000);
+            log('⚠️ 请求被限流');
+            showStatus('请求太频繁，请稍后手动重试');
             return;
         }
 
@@ -844,9 +857,8 @@ async function fetchAndExtractPrompts(forceRefresh) {
         const data = await resp.json();
         lastFetchConvId = convId;
 
-        allRounds = buildRounds(data);
         seenPrompts.clear();
-        allRounds.flatMap(r => r.prompts).forEach(p => seenPrompts.add(p.prompt));
+        allRounds = buildRounds(data);
 
         // 第一次尝试匹配图片
         enrichWithDomImages(allRounds, data);
@@ -873,6 +885,35 @@ async function fetchAndExtractPrompts(forceRefresh) {
     }
 }
 
+async function manualFetchPrompts() {
+    if (!getConversationId()) {
+        toast('请先打开一个对话');
+        updateFab();
+        return;
+    }
+    if (isFetchingPrompts) return;
+
+    const refreshBtn = document.getElementById('rp-refresh');
+    const fab = document.getElementById('rp-fab');
+    isFetchingPrompts = true;
+    if (refreshBtn) {
+        refreshBtn.disabled = true;
+        refreshBtn.innerHTML = `${SVG.refresh} 提取中`;
+    }
+    if (fab) fab.disabled = true;
+
+    try {
+        await fetchAndExtractPrompts(true);
+    } finally {
+        isFetchingPrompts = false;
+        if (refreshBtn) {
+            refreshBtn.disabled = false;
+            refreshBtn.innerHTML = `${SVG.refresh} 提取`;
+        }
+        if (fab) fab.disabled = false;
+    }
+}
+
 // ===== 主循环 =====
 let lastUrl = '';
 function startMonitoring() {
@@ -884,7 +925,6 @@ function startMonitoring() {
             const body = document.getElementById('rp-body'); if (body) body.innerHTML = '';
             const panel = document.getElementById('rp-panel'); if (panel) panel.classList.remove('open');
             updateFab(); updateFooter();
-            if (getConversationId()) setTimeout(() => fetchAndExtractPrompts(), 2000);
         }
     };
     setInterval(checkUrl, 1000);
@@ -893,27 +933,27 @@ function startMonitoring() {
     const obs = new MutationObserver(() => {
         if (debounce) clearTimeout(debounce);
         debounce = setTimeout(() => {
-            const imgs = getAllDomImages();
             const total = allRounds.reduce((s,r) => s + r.prompts.length, 0);
-            if (imgs.length > 0 && total === 0 && getConversationId()) fetchAndExtractPrompts();
-            else if (total > 0) {
-                // 仅更新图片匹配，不再重复 API 请求
-                const noImgCount = allRounds.flatMap(r => r.prompts).filter(p => p.imageUrls.length === 0).length;
-                if (noImgCount > 0 && imgs.length > 0) { enrichWithDomImages(allRounds, null); renderPanel(); }
-            }
+            if (total === 0) return;
+
+            // 已手动提取到提示词后，仅补充图片匹配，不再重复 API 请求
+            const noImgCount = allRounds.flatMap(r => r.prompts).filter(p => p.imageUrls.length === 0).length;
+            if (noImgCount === 0) return;
+
+            const imgs = getAllDomImages();
+            if (imgs.length > 0) { enrichWithDomImages(allRounds, null); renderPanel(); }
         }, 5000); // 从 3 秒改为 5 秒，减少触发频率
     });
     obs.observe(document.body, { childList: true, subtree: true });
 
     if (getConversationId()) {
         log('当前对话:', getConversationId());
-        showStatus('正在获取对话数据...');
-        fetchAndExtractPrompts();
+        updateFab();
     }
 }
 
 function boot() {
-    log('🎨 v4.0 启动 (缩略图+多选+批量下载)');
+    log('🎨 v5.1 启动 (手动提取+缩略图+多选+批量下载)');
     injectStyles(); createFab(); createPanel(); startMonitoring();
 }
 

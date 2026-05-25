@@ -26,6 +26,10 @@ A floating button (🖌) appears in the bottom-right corner on ChatGPT conversat
 - ✅ Multi-strategy extraction (code blocks, tool messages, DALL-E metadata)
 - ✅ Cleans up internal control tokens like `<|has_watermark|>`
 
+**v5.2 — Advanced Robustness & Bug Fixes**
+- 🔄 **Reliable Multi-turn Prompt Extraction** — Resolved the bug where only the first turn's prompts were extracted, by replacing the linear traversal chain with a full DFS mapping tree and sorting images by creation time.
+- 🛡️ **User-Uploaded Image Filtering** — Implemented 3-layer filtering (DOM role checks, backend file ID blacklist, context exclusion) to prevent user-uploaded source photos from leaking into the script panel as generated output.
+
 **v5.0 — Visual Management & Batch Downloads**
 - 🖼️ **Thumbnail hover preview** — hover over any thumbnail to smoothly reveal a large, uncropped high-res preview
 - ☑️ **Multi-select & ZIP Batch download** — download all, selected, or per-round images dynamically packaged into a `.zip` archive
@@ -106,6 +110,10 @@ The script uses `@grant none`, meaning it runs in the page's own JavaScript cont
 - ✅ 手动提取，不在后台自动轮询 API
 - ✅ 多策略提取（代码块、tool 消息、DALL-E metadata）
 - ✅ 自动清除 `<|has_watermark|>` 等内部控制标记
+
+**v5.2 — 鲁棒性增强与缺陷修复**
+- 🔄 **可靠的多轮对话提取** — 重构了提示词路径搜索算法，用完整的深度优先搜索 (DFS) 和创建时间排序替代单链遍历，解决多轮对话下可能只显示第一轮提示词的问题。
+- 🛡️ **精确过滤用户上传图** — 引入 DOM 位置校验（排除 user 消息）、file ID 黑名单和过滤传递等三级防御机制，防止用户自己上传的参考图被错误加载到脚本面板中。
 
 **v5.0 — 视觉化管理与批量下载**
 - 🖼️ **缩略图悬浮预览** — 鼠标悬停在提示词缩略图上时，左侧会平滑浮出无裁切的高清大图预览

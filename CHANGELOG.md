@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.2.1] - 2026-05-25
+
+### Fixed
+- **Multi-turn prompt extraction**: Rewrote `getOrderedPath` from single-branch chain traversal to full DFS + `create_time` sorting — previously only extracting prompts from the first round when the conversation tree had branches (multiple DALL-E tool calls, edited messages, etc.)
+- **User-uploaded images misidentified as generated**: Added three-layer filtering to exclude user-uploaded images from thumbnails and downloads:
+  - **DOM position check**: New `isImageInUserMessage()` detects images inside `[data-message-author-role="user"]` containers
+  - **File ID exclusion**: `buildRounds` now collects `asset_pointer` file IDs from user messages into an exclusion set, passed through the entire image matching pipeline
+  - **Function-level filtering**: `extractImageUrlsFromParts`, `getAllDomImages`, `getImagesFromDomByMsgId`, `enrichWithDomImages`, and `resolveFileIds` all now accept and apply the exclusion set
+
+### Changed
+- `buildRounds` return type changed from array to `{ rounds, userUploadedFileIds }` object
+- `getAllDomImages`, `getImagesFromDomByMsgId`, `extractImageUrlsFromParts`, `enrichWithDomImages`, `resolveFileIds` all accept optional `excludeFileIds` parameter
+- Exclusion set is reset on conversation switch and persisted as module-level `_userUploadedFileIds`
+
+---
+
 ## [5.0.0] - 2026-05-01
 
 ### Added

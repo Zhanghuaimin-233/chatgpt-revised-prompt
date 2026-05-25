@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 图片生成优化提示词提取器
 // @namespace    https://github.com/kadevin/chatgpt-revised-prompt
-// @version      5.1.0
+// @version      5.2.1
 // @description  手动提取 ChatGPT 图片生成优化提示词，支持缩略图预览、多选批量下载
 // @author       iLab
 // @match        https://chatgpt.com/*
@@ -63,6 +63,7 @@ let lastFetchTime = 0; // 请求节流
 let lastFetchConvId = ''; // 避免重复请求同一对话
 const FETCH_COOLDOWN = 5000; // 最小请求间隔 5 秒
 let isFetchingPrompts = false;
+let _userUploadedFileIds = new Set(); // 用户上传图片的 file ID 排除集
 
 function injectStyles() {
     if (document.getElementById('rp-styles')) return;
@@ -357,11 +358,13 @@ async function downloadAll() {
 }
 
 // 懒解析：在渲染前尝试从 DOM 匹配 fileIds 到图片 URL
-function resolveFileIds() {
+function resolveFileIds(excludeFileIds = _userUploadedFileIds) {
     const allP = allRounds.flatMap(r => r.prompts);
     for (const item of allP) {
         if (item.imageUrls.length > 0 || !item.fileIds || item.fileIds.length === 0) continue;
         for (const fid of item.fileIds) {
+            // 跳过用户上传的图片
+            if (excludeFileIds.has(fid)) continue;
             const img = document.querySelector(`img[src*="${fid}"]`);
             if (img && img.src && !item.imageUrls.includes(img.src)) {
                 item.imageUrls.push(img.src);
@@ -370,7 +373,7 @@ function resolveFileIds() {
     }
     // 兜底：收集所有 DOM 图片按顺序分配
     if (allP.some(p => p.imageUrls.length === 0 && p.fileIds?.length > 0)) {
-        const domImgs = getAllDomImages();
+        const domImgs = getAllDomImages(excludeFileIds);
         const usedUrls = new Set(allP.flatMap(p => p.imageUrls));
         const unused = domImgs.filter(u => !usedUrls.has(u));
         let idx = 0;
@@ -522,29 +525,56 @@ function buildCard(item, index) {
 }
 
 // ===== 对话路径排序 =====
+// 深度优先遍历整棵对话树，按 create_time 排序，确保覆盖所有分支节点
 function getOrderedPath(mapping) {
     const childrenOf = {};
     for (const [id, node] of Object.entries(mapping)) {
         const pid = node.parent;
         if (pid) { if (!childrenOf[pid]) childrenOf[pid] = []; childrenOf[pid].push(id); }
     }
+
+    // 对每个节点的 children 按 create_time 排序（旧 → 新）
+    for (const pid of Object.keys(childrenOf)) {
+        childrenOf[pid].sort((a, b) => {
+            const ta = mapping[a]?.message?.create_time || 0;
+            const tb = mapping[b]?.message?.create_time || 0;
+            return ta - tb;
+        });
+    }
+
     const root = Object.keys(mapping).find(id => !mapping[id].parent);
     if (!root) return Object.keys(mapping);
+
+    // 深度优先遍历，收集所有节点
     const path = [];
     const visited = new Set();
-    let cur = root;
-    while (cur && !visited.has(cur)) {
-        visited.add(cur); path.push(cur);
+    const stack = [root];
+    while (stack.length > 0) {
+        const cur = stack.pop();
+        if (visited.has(cur)) continue;
+        visited.add(cur);
+        path.push(cur);
+        // 逆序入栈，保证先遍历排序靠前（时间较早）的子节点
         const ch = childrenOf[cur] || [];
-        cur = ch[ch.length - 1];
+        for (let i = ch.length - 1; i >= 0; i--) {
+            stack.push(ch[i]);
+        }
     }
+
+    // 最终按 create_time 排序保证时间顺序
+    path.sort((a, b) => {
+        const ta = mapping[a]?.message?.create_time || 0;
+        const tb = mapping[b]?.message?.create_time || 0;
+        return ta - tb;
+    });
+
     return path;
 }
 
 // ===== 提取图片 URL =====
 // ChatGPT 图片在 API 中使用 asset_pointer 格式: "file-service://file-xxxx"
 // 需要从 DOM 中匹配对应的 <img> 元素获取真实 URL
-function extractImageUrlsFromParts(parts) {
+function extractImageUrlsFromParts(parts, excludeFileIds = _userUploadedFileIds) {
     const urls = [];
     const fileIds = [];
     for (const part of parts) {
@@ -565,8 +595,12 @@ function extractImageUrlsFromParts(parts) {
         if (dalle?.image_url) urls.push(dalle.image_url);
         if (dalle?.url) urls.push(dalle.url);
     }
-    // 从 DOM 中通过 file ID 查找实际图片 URL
+    // 从 DOM 中通过 file ID 查找实际图片 URL（排除用户上传的）
     for (const fid of fileIds) {
+        if (excludeFileIds.has(fid)) {
+            log('🚫 extractImageUrls: 跳过用户上传 file ID:', fid);
+            continue;
+        }
         const img = document.querySelector(`img[src*="${fid}"]`);
         if (img && img.src) {
             urls.push(img.src);
@@ -590,7 +624,21 @@ function extractFileIdsFromParts(parts) {
     return ids;
 }
 
-function getAllDomImages() {
+// 判断一个 img 元素是否位于用户消息区域内
+function isImageInUserMessage(img) {
+    // ChatGPT DOM 中用户消息的容器带有 data-message-author-role="user"
+    const msgEl = img.closest('[data-message-author-role]');
+    if (msgEl && msgEl.getAttribute('data-message-author-role') === 'user') return true;
+    // 备用检测：向上查找带 data-message-id 的元素，检查其内部是否标记为 user
+    const msgContainer = img.closest('[data-message-id]');
+    if (msgContainer) {
+        const roleEl = msgContainer.querySelector('[data-message-author-role="user"]');
+        if (roleEl) return true;
+    }
+    return false;
+}
+
+function getAllDomImages(excludeFileIds = _userUploadedFileIds) {
     // 在主聊天区内查找所有可能的生成图片
     const mainArea = document.querySelector('#thread') || document.querySelector('main') || document.body;
     const allImgs = [...mainArea.querySelectorAll('img[src^="https"]')];
@@ -598,23 +646,45 @@ function getAllDomImages() {
         .filter(img => {
             const s = img.src;
             if (s.includes('cdn.openai.com') || s.includes('favicon') || s.includes('sprites') || s.includes('avatar') || s.includes('og.png')) return false;
+            // 排除用户消息中的图片（通过 DOM 位置判断）
+            if (isImageInUserMessage(img)) {
+                log('🚫 排除用户消息中的图片 (DOM位置)');
+                return false;
+            }
+            // 排除用户上传的图片（通过 file ID 匹配）
+            for (const fid of excludeFileIds) {
+                if (s.includes(fid)) {
+                    log('🚫 排除用户上传图片 (fileID):', fid);
+                    return false;
+                }
+            }
             if (s.includes('oaiusercontent') || s.includes('openai.com/file') || s.includes('dalleprodsec')) return true;
             if (img.naturalWidth >= 100 || img.width >= 100) return true;
             if (img.alt && img.alt.length > 5) return true;
             return false;
         })
         .map(img => img.src);
-    log('🖼️ getAllDomImages:', results.length, '张');
+    log('🖼️ getAllDomImages:', results.length, '张 (排除', excludeFileIds.size, '个用户上传)');
     return [...new Set(results)];
 }
 
-function getImagesFromDomByMsgId(msgId) {
+function getImagesFromDomByMsgId(msgId, excludeFileIds = _userUploadedFileIds) {
     if (!msgId) return [];
     let el = document.querySelector(`[data-message-id="${msgId}"]`);
     if (el) {
         const imgs = [...el.querySelectorAll('img[src^="https"]')]
-            .map(i => i.src)
-            .filter(s => !s.includes('cdn.openai.com') && !s.includes('favicon') && !s.includes('sprites'));
+            .filter(img => {
+                const s = img.src;
+                if (s.includes('cdn.openai.com') || s.includes('favicon') || s.includes('sprites')) return false;
+                // 排除用户消息中的图片
+                if (isImageInUserMessage(img)) return false;
+                // 排除用户上传的文件
+                for (const fid of excludeFileIds) {
+                    if (s.includes(fid)) return false;
+                }
+                return true;
+            })
+            .map(img => img.src);
         if (imgs.length) return imgs;
     }
     return [];
@@ -623,12 +693,13 @@ function getImagesFromDomByMsgId(msgId) {
 // ===== 核心提取 =====
 function buildRounds(conversationData) {
     const mapping = conversationData?.mapping;
-    if (!mapping) return [];
+    if (!mapping) return { rounds: [], userUploadedFileIds: new Set() };
 
     const path = getOrderedPath(mapping);
     const rounds = [];
     let currentRound = null;
     let lastAssistantMsgId = null;
+    const userUploadedFileIds = new Set(); // 收集用户上传图片的 file ID
 
     // Helper: add prompt to current round
     function addPrompt(prompt, source, imageUrls, toolMsgId, fileIds) {
@@ -669,6 +740,19 @@ function buildRounds(conversationData) {
             currentRound.userText = up;
             rounds.push(currentRound);
             lastAssistantMsgId = null;
+
+            // 收集用户上传图片的 file ID（用于后续排除）
+            if (Array.isArray(parts)) {
+                for (const part of parts) {
+                    if (part && typeof part === 'object' && part.asset_pointer && typeof part.asset_pointer === 'string') {
+                        const fid = part.asset_pointer.replace('file-service://', '');
+                        if (fid) {
+                            userUploadedFileIds.add(fid);
+                            log('📎 记录用户上传图片:', fid);
+                        }
+                    }
+                }
+            }
         }
 
         // 跳过 system 角色
@@ -722,7 +806,8 @@ function buildRounds(conversationData) {
     // 重新编号轮次（过滤空轮后）
     const filtered = rounds.filter(r => r.prompts.length > 0);
     filtered.forEach((r, i) => r.roundIndex = i + 1);
-    return filtered;
+    log('📎 用户上传图片 file ID 共', userUploadedFileIds.size, '个:', [...userUploadedFileIds]);
+    return { rounds: filtered, userUploadedFileIds };
 }
 
 function extractPromptsFromCode(codeText) {
@@ -742,8 +827,8 @@ function extractPromptsFromCode(codeText) {
 }
 
 // ===== 用 DOM 补充图片 URL =====
-function enrichWithDomImages(rounds, conversationData) {
-    const domImgs = getAllDomImages();
+function enrichWithDomImages(rounds, conversationData, excludeFileIds = _userUploadedFileIds) {
+    const domImgs = getAllDomImages(excludeFileIds);
     log('🖼️ DOM 中找到图片数:', domImgs.length, domImgs.slice(0, 3));
 
     const allP = rounds.flatMap(r => r.prompts);
@@ -761,6 +846,8 @@ function enrichWithDomImages(rounds, conversationData) {
                     if (!Array.isArray(parts)) break;
                     const fileIds = extractFileIdsFromParts(parts);
                     for (const fid of fileIds) {
+                        // 跳过用户上传的图片
+                        if (excludeFileIds.has(fid)) continue;
                         const domMatch = domImgs.find(url => url.includes(fid));
                         if (domMatch && !item.imageUrls.includes(domMatch)) {
                             item.imageUrls.push(domMatch);
@@ -858,10 +945,12 @@ async function fetchAndExtractPrompts(forceRefresh) {
         lastFetchConvId = convId;
 
         seenPrompts.clear();
-        allRounds = buildRounds(data);
+        const result = buildRounds(data);
+        allRounds = result.rounds;
+        _userUploadedFileIds = result.userUploadedFileIds;
 
         // 第一次尝试匹配图片
-        enrichWithDomImages(allRounds, data);
+        enrichWithDomImages(allRounds, data, _userUploadedFileIds);
 
         const total = allRounds.reduce((s,r) => s + r.prompts.length, 0);
         log(`✅ 提取 ${total} 个提示词，${allRounds.length} 轮对话`);
@@ -874,7 +963,7 @@ async function fetchAndExtractPrompts(forceRefresh) {
         if (noImgCount > 0) {
             log(`⏳ ${noImgCount} 个提示词无图片，3秒后重试DOM匹配...`);
             setTimeout(() => {
-                enrichWithDomImages(allRounds, data);
+                enrichWithDomImages(allRounds, data, _userUploadedFileIds);
                 renderPanel();
                 log('🔄 延迟图片匹配完成');
             }, 3000);
@@ -921,6 +1010,7 @@ function startMonitoring() {
         if (location.href !== lastUrl) {
             lastUrl = location.href;
             allRounds = []; seenPrompts.clear();
+            _userUploadedFileIds = new Set(); // 重置用户上传图片排除集
             lastFetchConvId = ''; // 重置，允许新对话请求
             const body = document.getElementById('rp-body'); if (body) body.innerHTML = '';
             const panel = document.getElementById('rp-panel'); if (panel) panel.classList.remove('open');
@@ -940,8 +1030,8 @@ function startMonitoring() {
             const noImgCount = allRounds.flatMap(r => r.prompts).filter(p => p.imageUrls.length === 0).length;
             if (noImgCount === 0) return;
 
-            const imgs = getAllDomImages();
-            if (imgs.length > 0) { enrichWithDomImages(allRounds, null); renderPanel(); }
+            const imgs = getAllDomImages(_userUploadedFileIds);
+            if (imgs.length > 0) { enrichWithDomImages(allRounds, null, _userUploadedFileIds); renderPanel(); }
         }, 5000); // 从 3 秒改为 5 秒，减少触发频率
     });
     obs.observe(document.body, { childList: true, subtree: true });
@@ -953,7 +1043,7 @@ function startMonitoring() {
 }
 
 function boot() {
-    log('🎨 v5.1 启动 (手动提取+缩略图+多选+批量下载)');
+    log('🎨 v5.2 启动 (修复多轮提取+排除用户上传图)');
     injectStyles(); createFab(); createPanel(); startMonitoring();
 }
 

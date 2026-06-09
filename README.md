@@ -18,6 +18,14 @@ When you ask ChatGPT to generate images using DALL-E 3 / GPT-image-2, it interna
 
 A floating button (🖌) appears in the bottom-right corner on ChatGPT conversation pages. Click it to manually extract revised prompts and open the management panel; use the panel's **Extract** button to refresh.
 
+### Related project: iLab GPT Conjure
+
+If you need a full local WebUI workbench for GPT-image-2 generation, reference
+images, prompt templates, shared gallery assets, local task history, and portable
+packages, see [iLab GPT Conjure](https://github.com/kadevin/ilab-gpt-conjure).
+Prompts extracted by this userscript can be copied into Conjure as direct
+generation inputs or reusable prompt templates.
+
 ### Features
 
 **Core**
@@ -102,6 +110,14 @@ The script uses `@grant none`, meaning it runs in the page's own JavaScript cont
 当你要求 ChatGPT 使用 DALL-E 3 / GPT-image-2 生成图片时，它会在内部将你的原始提示词改写成一个更详细、更优化的版本，再发送给图像模型。这个**优化后的提示词（revised prompt）** 通常对用户是隐藏的 —— 这个油猴脚本就是用来将它提取并显示出来的。
 
 在 ChatGPT 对话页中，页面右下角会出现一个悬浮按钮（画笔图标）。点击后会手动提取优化提示词并展开管理面板；也可以在面板中点击「提取」重新刷新。
+
+### 关联项目：iLab GPT Conjure
+
+如果你需要完整的 GPT-image-2 本地 WebUI 工作台，包含参考图生成、提示词模板、
+公用图库、本地任务历史和免安装一键包，可以使用
+[iLab GPT Conjure](https://github.com/kadevin/ilab-gpt-conjure)。
+本脚本提取出的 revised prompt 可以直接复制到 Conjure 中生成图片，也可以沉淀为
+可复用的提示词模板。
 
 ### 功能特性
 

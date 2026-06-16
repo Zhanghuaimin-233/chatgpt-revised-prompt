@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 图片生成优化提示词提取器
 // @namespace    https://github.com/kadevin/chatgpt-revised-prompt
-// @version      0.2.5
+// @version      0.3.1
 // @description  手动提取 ChatGPT 图片生成优化提示词 + 提示词库管理与快捷填入
 // @author       iLab
 // @match        https://chatgpt.com/*
@@ -31,7 +31,7 @@
         CAT_ORDER_KEY: 'promptManager.categoryOrder',
         PANEL_ID: 'gpt-panel',
         FAB_ID: 'gpt-fab',
-        VERSION: '0.2.5',
+        VERSION: '0.3.1',
         DEFAULT_CATEGORIES: ['通用模板', '人物描述', '风格', '构图', '光影与质感', '负面提示词', '文字与签名'],
     };
 
@@ -154,81 +154,105 @@
     // Section 3.5: Template Variable Functions
     // ============================================================
     function parseTemplate(template) {
-        const matches = template.match(/\{([^{}]+)\}/g);
-        if (!matches) return [];
-        return [...new Set(matches.map(m => {
-            const inner = m.slice(1, -1);
-            const eqIdx = inner.indexOf('=');
-            return eqIdx > -1 ? inner.slice(0, eqIdx) : inner;
-        }))];
-    }
-
-    function parseArgs(text) {
-        const named = {};
-        const positional = [];
-        // Match: name='value' or name="value" (named), 'value' (positional), '' (skip)
-        const re = /([\w一-鿿㐀-䶿]+)=(['"])((?:(?!\2).)*)\2|'(([^']*)?)'/g;
-        let m;
-        while ((m = re.exec(text)) !== null) {
-            if (m[1]) {
-                named[m[1]] = m[3];
-            } else {
-                positional.push(m[4] === '' ? '__SKIP__' : m[4]);
+        const variables = [];
+        const seen = new Set();
+        template.replace(/{([^{}]+)}/g, (_, inner) => {
+            const eqIdx = inner.indexOf("=");
+            const varName = (eqIdx > -1 ? inner.slice(0, eqIdx) : inner).trim();
+            if (!seen.has(varName)) {
+                seen.add(varName);
+                const defaultVal = eqIdx > -1 ? inner.slice(eqIdx + 1).replace(/^['"‘“]|['"’”]$/g, "") : null;
+                variables.push({ name: varName, defaultVal: defaultVal || null });
             }
-        }
-        return { named, positional };
-    }
-
-    function fillTemplate(template, named, positional) {
-        // 1. Parse all placeholders
-        const placeholders = [];
-        template.replace(/\{([^{}]+)\}/g, (fullMatch, inner) => {
-            const eqIdx = inner.indexOf('=');
-            placeholders.push({
-                full: fullMatch,
-                varName: eqIdx > -1 ? inner.slice(0, eqIdx) : inner,
-                defaultVal: eqIdx > -1 ? inner.slice(eqIdx + 1).replace(/^['"]|['"]$/g, '') : null
-            });
-            return '';
+            return "";
         });
-        // 2. Build value map: skip markers leave variables unfilled
-        const valueMap = {};
-        let posIdx = 0;
-        for (const ph of placeholders) {
-            if (ph.varName in named) {
-                valueMap[ph.varName] = named[ph.varName];
-            } else if (posIdx < positional.length) {
-                if (positional[posIdx] === '__SKIP__') {
-                    posIdx++;
-                } else {
-                    valueMap[ph.varName] = positional[posIdx++];
-                }
+        return variables;
+    }
+
+            function unwrapInput(text) {
+        const s = text;
+        if (s.length >= 2) {
+            const o = s.charCodeAt(0);
+            const c = s.charCodeAt(s.length - 1);
+            // 39=', 34=", 8216=‘, 8217=’, 8220=“, 8221=”
+            if ((o === 39 && c === 39) || (o === 34 && c === 34) ||
+                (o === 8216 && c === 8217) || (o === 8220 && c === 8221)) {
+                return { raw: s.slice(1, -1) };
             }
         }
-        // 3. Replace
-        return template.replace(/\{([^{}]+)\}/g, (fullMatch, inner) => {
-            const eqIdx = inner.indexOf('=');
-            const varName = eqIdx > -1 ? inner.slice(0, eqIdx) : inner;
-            if (varName in valueMap) return valueMap[varName];
-            if (eqIdx > -1) {
-                const defaultVal = inner.slice(eqIdx + 1).replace(/^['"]|['"]$/g, '');
-                if (defaultVal) return defaultVal;
+        return { error: "输入内容必须整体由一组成对引号包裹" };
+    }
+
+    function splitEscaped(raw) {
+        if (raw === '') return [];
+        return raw.split(/(?<!\\)\|/).map(s =>
+            s.replace(/\\\|/g, '|').replace(/\\\\/g, '\\').replace(/\\n/g, '\n')
+        );
+    }
+
+    function resolveArgs(variables, tokens) {
+        const values = {};
+        const occupied = new Set();
+        const skipped = new Set();
+        const errors = [];
+        let pointer = 0;
+        const varNames = new Set(variables.map(v => v.name));
+
+        for (const token of tokens) {
+            const eqIdx = token.indexOf('=');
+            const isNamed = eqIdx > 0 && varNames.has(token.slice(0, eqIdx));
+
+            if (isNamed) {
+                const name = token.slice(0, eqIdx);
+                const val = token.slice(eqIdx + 1);
+                if (occupied.has(name)) { errors.push('变量「' + name + '」被重复赋值'); continue; }
+                if (val === '') { skipped.add(name); occupied.add(name); }
+                else { values[name] = val; occupied.add(name); }
+            } else if (eqIdx > 0 && /^[a-zA-Z0-9_一-鿿㐀-䶿]+$/.test(token.slice(0, eqIdx))) {
+                // Looks like a named param but variable doesn't exist
+                errors.push('未知变量「' + token.slice(0, eqIdx) + '」，模板中不存在该变量');
+            } else {
+                while (pointer < variables.length && occupied.has(variables[pointer].name)) pointer++;
+                if (pointer >= variables.length) { errors.push("顺序参数过多，多余：「" + token + "」"); continue; }
+                const v = variables[pointer];
+                if (token === "") { skipped.add(v.name); occupied.add(v.name); }
+                else { values[v.name] = token; occupied.add(v.name); }
+                pointer++;
             }
+        }
+        return { values, skipped, occupied, errors };
+    }
+
+    function fillTemplate(template, variables, result) {
+        if (!result) return template;
+        return template.replace(/{([^{}]+)}/g, (fullMatch, inner) => {
+            const eqIdx = inner.indexOf("=");
+            const varName = (eqIdx > -1 ? inner.slice(0, eqIdx) : inner).trim();
+            const defaultVal = eqIdx > -1 ? inner.slice(eqIdx + 1).replace(/^['"‘“]|['"’”]$/g, "") : null;
+            if (varName in result.values) return result.values[varName];
+            if (result.skipped.has(varName) && defaultVal) return defaultVal;
+            if (defaultVal) return defaultVal;
             return fullMatch;
         });
     }
 
     function readArgsFromEditor() {
         const ev = SiteAdapter.getEditorView();
-        if (!ev) return { named: {}, positional: [] };
-        const text = ev.state.doc.textContent;
-        const args = parseArgs(text);
-        // Clear the editor after reading args
+        if (!ev) return null;
+        const text = ev.state.doc.textContent.trim();
+        if (!text) return null;
+        const unwrapped = unwrapInput(text);
+        if (unwrapped.error) return null; // not quoted = no args, treat as regular text
+        return { tokens: splitEscaped(unwrapped.raw) };
+    }
+
+    function clearEditor() {
+        const ev = SiteAdapter.getEditorView();
+        if (!ev) return;
         try {
             const tr = ev.state.tr.delete(0, ev.state.doc.content.size);
             ev.props.dispatchTransaction.call(ev, tr);
         } catch(e) {}
-        return args;
     }
 
     // ============================================================
@@ -2098,22 +2122,34 @@
                     · 点击「填发」将提示词填入并自动发送<br>
                     · 点击「收藏」将提示词置顶<br>
                     · 拖拽卡片可调整顺序<br><br>
-                    <b>模板变量用法：</b><br>
-                    在提示词内容中使用 <code>{变量名}</code> 定义占位符，填入时在输入框用单引号传入实参。<br><br>
-                    <b>示例 1 — 按顺序传参：</b><br>
+                    <b>模板变量：</b><br>
+                    在提示词中用 <code>{变量名}</code> 定义占位符。<br>
+                    可设置默认值：<code>{变量名='默认值'}</code><br>
+                    输入框为空时自动使用默认值，有非引号内容时正常追加。<br><br>
+                    <b>传参格式：</b><br>
+                    输入框中用引号包裹参数，支持 <code>'</code> <code>"</code> <code>'</code> <code>"</code>，开头结尾必须是同一种引号。<br>
+                    参数用 <code>|</code> 分隔。<br><br>
+                    <b>示例 1 — 顺序传参：</b><br>
                     提示词：<code>画一幅{主体}在{场景}的{风格}画</code><br>
-                    输入框：<code>'猫' '花园' '水彩'</code><br>
+                    输入框：<code>'猫|花园|水彩'</code><br>
                     结果：<code>画一幅猫在花园的水彩画</code><br><br>
-                    <b>示例 2 — 按名称传参：</b><br>
-                    输入框：<code>场景='草地'</code><br>
-                    结果：<code>画一幅{主体}在草地的{风格}画</code>（只替换指定变量）<br><br>
-                    <b>示例 3 — 跳过变量：</b><br>
-                    输入框：<code>'' '草地'</code><br>
-                    结果：<code>画一幅{主体}在草地的{风格}画</code>（第一个变量跳过）<br><br>
-                    <b>示例 4 — 默认值：</b><br>
+                    <b>示例 2 — 命名传参：</b><br>
+                    输入框：<code>'主体=猫|风格=水彩'</code><br>
+                    结果：<code>画一幅猫在{场景}的水彩画</code><br><br>
+                    <b>示例 3 — 混用传参：</b><br>
+                    输入框：<code>'猫|场景=花园|水彩'</code><br>
+                    结果：<code>画一幅猫在花园的水彩画</code><br><br>
+                    <b>示例 4 — 跳过变量：</b><br>
+                    输入框：<code>'猫||水彩'</code><br>
+                    结果：<code>画一幅猫在{场景}的水彩画</code>（空位跳过）<br><br>
+                    <b>示例 5 — 默认值：</b><br>
                     提示词：<code>画一幅{主体='猫'}在{场景}的{风格}画</code><br>
                     输入框：（空）<br>
-                    结果：<code>画一幅猫在{场景}的{风格}画</code>（未传参时使用默认值）<br>
+                    结果：<code>画一幅猫在{场景}的{风格}画</code><br><br>
+                    <b>示例 6 — 空位触发默认值：</b><br>
+                    输入框：<code>'|花园|水彩'</code><br>
+                    结果：<code>画一幅猫在花园的水彩画</code><br><br>
+                    <b>转义：</b> <code>\\|</code> 竖线 · <code>\\\\</code> 反斜杠 · <code>\\n</code> 换行
                     </div>
                 `,
                 confirmText: '知道了'
@@ -2739,7 +2775,7 @@
                         </div>
                         <div class="pm-item-preview">${escHtml(p.content)}</div>
                         <div class="pm-item-meta">
-                            ${(() => { const vars = parseTemplate(p.content); return vars.length > 0 ? `<div class="pm-item-tags">${vars.map(v => `<span class="pm-tag pm-var-tag">{${escHtml(v)}}</span>`).join('')}</div>` : ''; })()}
+                            ${(() => { const vars = parseTemplate(p.content); return vars.length > 0 ? `<div class="pm-item-tags">${vars.map(v => { const def = v.defaultVal; const label = def ? (def.length > 5 ? v.name + "='" + def.slice(0, 5) + "…'" : v.name + "='" + def + "'") : v.name; return `<span class="pm-tag pm-var-tag">{${escHtml(label)}}</span>`; }).join('')}</div>` : ''; })()}
                             <div class="pm-item-actions">
                                 <button class="pm-btn-fill" data-id="${p.id}" title="追加到输入框"><span class="pm-btn-ico" aria-hidden="true">⌨️</span><span class="pm-btn-label">只填</span></button>
                                 <button class="pm-btn-fill-send" data-id="${p.id}" title="填入并发送"><span class="pm-btn-ico" aria-hidden="true">📨</span><span class="pm-btn-label">填发</span></button>
@@ -3158,10 +3194,19 @@
             const vars = parseTemplate(content);
             if (vars.length > 0) {
                 const args = readArgsFromEditor();
-                content = fillTemplate(content, args.named, args.positional);
-                replaced = true;
+                if (args) {
+                    if (args.error) { toast(args.error); return; }
+                    const result = resolveArgs(vars, args.tokens);
+                    if (result.errors.length > 0) { toast(result.errors[0]); return; }
+                    content = fillTemplate(content, vars, result);
+                    replaced = true;
+                    clearEditor();
+                } else {
+                    // No args in input box — apply defaults only
+                    content = fillTemplate(content, vars, { values: {}, skipped: new Set(), errors: [] });
+                }
             }
-            const success = SiteAdapter.insertText(content, 'append');
+            const success = SiteAdapter.insertText(content, replaced ? 'replace' : 'append');
             if (success) {
                 prompt.usageCount = (prompt.usageCount || 0) + 1;
                 prompt.lastUsedAt = new Date().toISOString();
@@ -3180,7 +3225,15 @@
             const vars = parseTemplate(content);
             if (vars.length > 0) {
                 const args = readArgsFromEditor();
-                content = fillTemplate(content, args.named, args.positional);
+                if (args) {
+                    if (args.error) { toast(args.error); return; }
+                    const result = resolveArgs(vars, args.tokens);
+                    if (result.errors.length > 0) { toast(result.errors[0]); return; }
+                    content = fillTemplate(content, vars, result);
+                    clearEditor();
+                } else {
+                    content = fillTemplate(content, vars, { values: {}, skipped: new Set(), errors: [] });
+                }
             }
             const success = SiteAdapter.insertText(content, 'replace');
             if (!success) { toast('未找到输入框，请点击 ChatGPT 输入区域后再试'); return; }
@@ -3188,15 +3241,14 @@
             prompt.lastUsedAt = new Date().toISOString();
             await StorageService.save(this._prompts);
             this.renderList();
-            toast('已填入，正在发送...');
-            // Wait for React state to update the send button
-            await new Promise(r => setTimeout(r, 300));
-            const sendBtn = document.querySelector('.composer-submit-button-color');
-            if (sendBtn && !sendBtn.disabled) {
-                sendBtn.click();
-            } else {
-                toast('发送按钮未就绪，请手动点击发送');
+            toast('已填入，等待发送...');
+            // Poll until send button is ready (max 45s)
+            for (let i = 0; i < 225; i++) {
+                await new Promise(r => setTimeout(r, 200));
+                const sendBtn = document.querySelector('.composer-submit-button-color');
+                if (sendBtn && !sendBtn.disabled) { sendBtn.click(); return; }
             }
+            toast('发送按钮未就绪，请手动点击发送');
         },
 
         async _deletePrompt(id) {
@@ -3378,7 +3430,7 @@
                     <input id="pm-edit-title" type="text" value="${escHtml(data.title || '')}" placeholder="给提示词起个名字" />
                     <label>内容</label>
                     <textarea id="pm-edit-content" placeholder="输入提示词内容...">${escHtml(data.content || '')}</textarea>
-                    <div style="margin:-8px 0 12px;font-size:11px;color:#9ca3af">使用 {变量名} 定义占位符，{变量名='默认值'} 设置默认值。传参：'值' 按顺序，变量名='值' 按名称，'' 跳过</div>
+                    <div style="margin:-8px 0 12px;font-size:11px;color:var(--suite-text-muted)">使用 {变量名} 定义占位符，{变量名='默认值'} 设置默认值。传参格式：'参数1|参数2' 或 "参数1|参数2"，空位跳过</div>
                     <label>分类</label>
                     <select id="pm-edit-category" class="pm-select-native" aria-hidden="true" tabindex="-1">
                         ${modalCategories.map(c => `<option value="${escAttr(c)}"${selectedCategory === c ? ' selected' : ''}>${escHtml(c)}</option>`).join('')}
@@ -3574,4 +3626,3 @@
     GM_registerMenuCommand('导出提示词备份', () => { StorageService.exportJSON(LibraryUI._prompts); toast('已导出'); });
 
     })();
-

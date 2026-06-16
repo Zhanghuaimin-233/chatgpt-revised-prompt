@@ -1761,6 +1761,15 @@
     .pm-btn-save{background:var(--suite-text);border-color:var(--suite-text) !important;color:var(--suite-bg)}
     .pm-btn-cancel:hover{background:var(--suite-bg-hover);border-color:var(--suite-border-strong)}
     .pm-btn-save:hover{transform:translateY(-1px);box-shadow:0 5px 16px rgba(0,0,0,.12)}
+    .pm-btn-danger{background:#ef4444;color:#fff;border:none;border-radius:10px;padding:8px 22px;
+        font-size:13px;font-weight:600;cursor:pointer;transition:all .15s ease}
+    .pm-btn-danger:hover{background:#dc2626;transform:translateY(-1px);box-shadow:0 5px 16px rgba(239,68,68,.25)}
+    .pm-dialog-modal{max-width:480px}
+    .pm-dialog-body{font-size:13px;color:var(--suite-text-muted);line-height:1.7;margin-bottom:16px}
+    .pm-dialog-input{width:100%;box-sizing:border-box;border:1px solid var(--suite-border);border-radius:12px;
+        background-color:var(--suite-bg-soft);color:var(--suite-text);padding:10px 12px;font-size:13px;
+        outline:none;margin-bottom:16px;transition:border-color .16s ease,box-shadow .16s ease}
+    .pm-dialog-input:focus{border-color:rgba(16,163,127,.55);box-shadow:0 0 0 4px var(--suite-focus)}
 
     /* ---- Import conflict dialog ---- */
     .pm-conflict-modal{width:520px;max-height:80vh}
@@ -1888,6 +1897,56 @@
         t._timer = setTimeout(() => t.classList.remove('show'), 2000);
     }
 
+    function showDialog({ title, body, input, inputValue, confirmText, cancelText, danger }) {
+        return new Promise(resolve => {
+            const overlay = document.createElement('div');
+            overlay.className = 'pm-modal-overlay';
+            overlay.innerHTML = `
+                <div class="pm-modal pm-dialog-modal">
+                    <h4>${escHtml(title)}</h4>
+                    ${body ? `<div class="pm-dialog-body">${body}</div>` : ''}
+                    ${input !== undefined ? `<input class="pm-dialog-input" type="text" value="${escHtml(inputValue || '')}" placeholder="${escHtml(input || '')}" />` : ''}
+                    <div class="pm-modal-btns">
+                        <button class="pm-btn-cancel" id="pm-dialog-cancel">${cancelText || '取消'}</button>
+                        <button class="${danger ? 'pm-btn-danger' : 'pm-btn-save'}" id="pm-dialog-confirm">${confirmText || '确认'}</button>
+                    </div>
+                </div>`;
+            document.body.appendChild(overlay);
+
+            const inputEl = overlay.querySelector('.pm-dialog-input');
+            if (inputEl) setTimeout(() => inputEl.focus(), 50);
+
+            let closed = false;
+            const close = (value) => {
+                if (closed) return;
+                closed = true;
+                document.removeEventListener('keydown', onKeydown);
+                overlay.remove();
+                resolve(value);
+            };
+
+            const onKeydown = (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); close(inputEl ? inputEl.value : true); }
+                if (e.key === 'Escape') { e.preventDefault(); close(null); }
+            };
+            document.addEventListener('keydown', onKeydown);
+
+            overlay.querySelector('#pm-dialog-cancel').addEventListener('click', () => close(null));
+            overlay.querySelector('#pm-dialog-confirm').addEventListener('click', () => {
+                close(inputEl ? inputEl.value : true);
+            });
+            overlay.addEventListener('click', e => { if (e.target === overlay) close(null); });
+        });
+    }
+
+    async function customConfirm(message, { danger } = {}) {
+        return showDialog({ title: '确认操作', body: message.replace(/\n/g, '<br>'), confirmText: '确定', cancelText: '取消', danger });
+    }
+
+    async function customPrompt(title, placeholder, defaultValue) {
+        return showDialog({ title, input: placeholder, inputValue: defaultValue, confirmText: '确定', cancelText: '取消' });
+    }
+
     // ============================================================
     // Section 11: UI - FAB
     // ============================================================
@@ -1983,7 +2042,7 @@
                 <div class="gpt-tab gpt-active" data-tab="extracted">${SVG.brush.replace('width="20" height="20"','width="14" height="14"')} 优化提示词</div>
                 <div class="gpt-tab" data-tab="library">${SVG.book} 提示词库</div>
                 <button class="gpt-mode-btn" id="gpt-mode-btn" title="切换停靠/悬浮模式">${SVG.pin}</button>
-                <button class="gpt-close" id="gpt-close" title="关闭">${SVG.arrow.replace('class="gpt-arrow"','style="transform:rotate(180deg)"')}</button>
+                <button class="gpt-mode-btn" id="gpt-help-btn" title="使用说明">?</button>
             </div>
             <div class="gpt-tab-body gpt-active" data-tab="extracted">
                 <div class="rp-hdr">
@@ -2028,7 +2087,38 @@
         });
 
         // Close
-        document.getElementById('gpt-close').addEventListener('click', () => togglePanel(false));
+        document.getElementById('gpt-help-btn').addEventListener('click', () => {
+            showDialog({
+                title: '使用说明',
+                body: `
+                    <div style="font-size:13px;line-height:1.8;color:var(--suite-text)">
+                    <b>提示词套件</b>用于管理、检索和快速填入提示词到 ChatGPT 输入框。<br><br>
+                    <b>基本功能：</b><br>
+                    · 点击「只填」将提示词追加到输入框<br>
+                    · 点击「填发」将提示词填入并自动发送<br>
+                    · 点击「收藏」将提示词置顶<br>
+                    · 拖拽卡片可调整顺序<br><br>
+                    <b>模板变量用法：</b><br>
+                    在提示词内容中使用 <code>{变量名}</code> 定义占位符，填入时在输入框用单引号传入实参。<br><br>
+                    <b>示例 1 — 按顺序传参：</b><br>
+                    提示词：<code>画一幅{主体}在{场景}的{风格}画</code><br>
+                    输入框：<code>'猫' '花园' '水彩'</code><br>
+                    结果：<code>画一幅猫在花园的水彩画</code><br><br>
+                    <b>示例 2 — 按名称传参：</b><br>
+                    输入框：<code>场景='草地'</code><br>
+                    结果：<code>画一幅{主体}在草地的{风格}画</code>（只替换指定变量）<br><br>
+                    <b>示例 3 — 跳过变量：</b><br>
+                    输入框：<code>'' '草地'</code><br>
+                    结果：<code>画一幅{主体}在草地的{风格}画</code>（第一个变量跳过）<br><br>
+                    <b>示例 4 — 默认值：</b><br>
+                    提示词：<code>画一幅{主体='猫'}在{场景}的{风格}画</code><br>
+                    输入框：（空）<br>
+                    结果：<code>画一幅猫在{场景}的{风格}画</code>（未传参时使用默认值）<br>
+                    </div>
+                `,
+                confirmText: '知道了'
+            });
+        });
 
         // Mode toggle (docked vs floating)
         document.getElementById('gpt-mode-btn').addEventListener('click', () => togglePanelMode());
@@ -2256,14 +2346,15 @@
         async _deleteCategory(name) {
             const promptsInCat = this._prompts.filter(p => p.category === name);
             const count = promptsInCat.length;
+            let msg;
             if (count > 0) {
-                const titles = promptsInCat.slice(0, 5).map(p => `· ${p.title}`).join('\n');
-                const more = count > 5 ? `\n...及其他 ${count - 5} 条` : '';
-                if (!confirm(`确定删除分类「${name}」？\n\n该分类下的 ${count} 条提示词将一并删除：\n${titles}${more}\n\n此操作不可撤销。`)) return;
+                const titles = promptsInCat.slice(0, 5).map(p => `· ${p.title}`).join('<br>');
+                const more = count > 5 ? `<br>...及其他 ${count - 5} 条` : '';
+                msg = `确定删除分类「${name}」？<br><br>该分类下的 <b>${count}</b> 条提示词将一并删除：<br>${titles}${more}<br><br>此操作不可撤销。`;
+            } else {
+                msg = `确定删除分类「${name}」？`;
             }
-            if (count === 0) {
-                if (!confirm(`确定删除分类「${name}」？`)) return;
-            }
+            if (!await customConfirm(msg, { danger: true })) return;
             this._prompts = this._prompts.filter(p => p.category !== name);
             this._categories = this._categories.filter(c => c !== name);
             await StorageService.save(this._prompts);
@@ -2339,8 +2430,8 @@
                 });
             });
 
-            document.getElementById('pm-cat-add')?.addEventListener('click', () => {
-                const name = prompt('请输入新分类名称：');
+            document.getElementById('pm-cat-add')?.addEventListener('click', async () => {
+                const name = await customPrompt('新增分类', '请输入分类名称');
                 if (name) this._addCategory(name);
             });
 
@@ -3111,7 +3202,7 @@
         async _deletePrompt(id) {
             const prompt = this._prompts.find(p => p.id === id);
             if (!prompt) return;
-            if (!confirm(`确定删除「${prompt.title}」？`)) return;
+            if (!await customConfirm(`确定删除「${prompt.title}」？`, { danger: true })) return;
             this._prompts = this._prompts.filter(p => p.id !== id);
             await StorageService.save(this._prompts);
             this.renderList();

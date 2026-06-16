@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 图片生成优化提示词提取器
 // @namespace    https://github.com/kadevin/chatgpt-revised-prompt
-// @version      0.2.0
+// @version      0.2.5
 // @description  手动提取 ChatGPT 图片生成优化提示词 + 提示词库管理与快捷填入
 // @author       iLab
 // @match        https://chatgpt.com/*
@@ -16,25 +16,28 @@
 // ==/UserScript==
 (function () {
     'use strict';
-    
+
     // ============================================================
     // Section 1: Configuration & Logging
     // ============================================================
     const DEBUG = true;
     function log(...a) { if (DEBUG) console.log('%c[GPT Suite]', 'color:#10a37f;font-weight:bold', ...a); }
-    
+
     const Config = {
         STORAGE_KEY: 'promptManager.prompts',
         CATEGORIES_KEY: 'promptManager.categories',
         MODE_KEY: 'promptManager.panelMode',
+        FREQUENT_ORDER_KEY: 'promptManager.frequentOrder',
+        CAT_ORDER_KEY: 'promptManager.categoryOrder',
         PANEL_ID: 'gpt-panel',
         FAB_ID: 'gpt-fab',
-        VERSION: '0.2.0',
+        VERSION: '0.2.5',
         DEFAULT_CATEGORIES: ['通用模板', '人物描述', '风格', '构图', '光影与质感', '负面提示词', '文字与签名'],
     };
-    
+
     function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-    
+    function escAttr(s) { return escHtml(String(s)).replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
     // ============================================================
     // Section 2: Storage Service
     // ============================================================
@@ -45,8 +48,14 @@
             for (const p of prompts) {
                 if (p.lastUsedAt === undefined) { p.lastUsedAt = null; migrated = true; }
                 if (p.editedAt !== undefined) { delete p.editedAt; migrated = true; }
+                if (p.sortOrder === undefined) { p.sortOrder = 0; migrated = true; }
             }
-            if (migrated) await GM_setValue(Config.STORAGE_KEY, prompts);
+            if (migrated) {
+                // Assign initial sortOrder by updatedAt desc (newest first = lower number)
+                const sorted = [...prompts].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+                sorted.forEach((p, i) => { p.sortOrder = i; });
+                await GM_setValue(Config.STORAGE_KEY, prompts);
+            }
             return prompts;
         },
         async save(prompts) {
@@ -62,8 +71,20 @@
         async saveCategories(cats) {
             await GM_setValue(Config.CATEGORIES_KEY, cats);
         },
+        async loadFrequentOrder() {
+            return (await GM_getValue(Config.FREQUENT_ORDER_KEY)) || [];
+        },
+        async saveFrequentOrder(order) {
+            await GM_setValue(Config.FREQUENT_ORDER_KEY, order);
+        },
+        async loadCategoryOrder() {
+            return (await GM_getValue(Config.CAT_ORDER_KEY)) || [];
+        },
+        async saveCategoryOrder(order) {
+            await GM_setValue(Config.CAT_ORDER_KEY, order);
+        },
         exportJSON(prompts) {
-            const exported = prompts.map(({ usageCount, lastUsedAt, ...rest }) => rest);
+            const exported = prompts.map(({ usageCount, lastUsedAt, sortOrder, ...rest }) => rest);
             const data = { app: 'Prompt Manager', schemaVersion: 1, exportedAt: new Date().toISOString(), prompts: exported };
             const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
@@ -88,7 +109,7 @@
             });
         },
     };
-    
+
     // ============================================================
     // Section 3: Prompt Service
     // ============================================================
@@ -102,6 +123,7 @@
                 tags: data.tags || [],
                 favorite: false,
                 usageCount: 0,
+                sortOrder: data.sortOrder || 0,
                 createdAt: new Date().toISOString(),
                 updatedAt: new Date().toISOString(),
                 lastUsedAt: null,
@@ -127,7 +149,7 @@
             return [...prompts].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
         },
     };
-    
+
     // ============================================================
     // Section 3.5: Template Variable Functions
     // ============================================================
@@ -140,7 +162,7 @@
             return eqIdx > -1 ? inner.slice(0, eqIdx) : inner;
         }))];
     }
-    
+
     function parseArgs(text) {
         const named = {};
         const positional = [];
@@ -156,7 +178,7 @@
         }
         return { named, positional };
     }
-    
+
     function fillTemplate(template, named, positional) {
         // 1. Parse all placeholders
         const placeholders = [];
@@ -195,7 +217,7 @@
             return fullMatch;
         });
     }
-    
+
     function readArgsFromEditor() {
         const ev = SiteAdapter.getEditorView();
         if (!ev) return { named: {}, positional: [] };
@@ -208,13 +230,13 @@
         } catch(e) {}
         return args;
     }
-    
+
     // ============================================================
     // Section 4: Site Adapter (ProseMirror Insertion)
     // ============================================================
     const SiteAdapter = {
         _editorView: null,
-    
+
         _findEditorView() {
             // Use unsafeWindow to get real DOM element with __reactFiber keys
             const pm = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).document.getElementById('prompt-textarea');
@@ -223,12 +245,12 @@
             if (!pmParent) return null;
             const fiberKey = Object.keys(pmParent).find(k => k.startsWith('__reactFiber'));
             if (!fiberKey) return null;
-    
+
             // Walk to React root fiber
             let root = pmParent[fiberKey];
             let walkSteps = 0;
             while (root.return && walkSteps < 5000) { root = root.return; walkSteps++; }
-    
+
             // DFS from root: check every component's hooks for the ProseMirror EditorView
             // (ChatGPT minified component names change across deployments)
             const stack = [root];
@@ -237,7 +259,7 @@
                 iter++;
                 const fiber = stack.pop();
                 if (!fiber) continue;
-    
+
                 let hook = fiber.memoizedState;
                 let hookIdx = 0;
                 while (hook && hookIdx < 20) {
@@ -246,19 +268,19 @@
                     hook = hook.next;
                     hookIdx++;
                 }
-    
+
                 if (fiber.sibling) stack.push(fiber.sibling);
                 if (fiber.child) stack.push(fiber.child);
             }
             return null;
         },
-    
+
         getEditorView() {
             if (this._editorView && this._editorView.dom?.isConnected) return this._editorView;
             this._editorView = this._findEditorView();
             return this._editorView;
         },
-    
+
         insertText(text, mode = 'append') {
             const ev = this.getEditorView();
             if (!ev) return false;
@@ -280,7 +302,7 @@
                 return true;
             } catch(e) { log('insertText error:', e); return false; }
         },
-    
+
         clearInput() {
             const ev = this.getEditorView();
             if (!ev) return false;
@@ -291,18 +313,18 @@
             } catch(e) { return false; }
         },
     };
-    
+
     // ============================================================
     // Section 5: Token & API Layer
     // ============================================================
     let _cachedToken = null;
     let _tokenExpiry = 0;
-    
+
     function getConversationId() {
         const m = location.pathname.match(/\/c\/([a-f0-9-]+)/);
         return m ? m[1] : null;
     }
-    
+
     function getAccessToken() {
         try {
             const doc = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).document;
@@ -316,7 +338,7 @@
         if (_cachedToken && Date.now() < _tokenExpiry) return _cachedToken;
         return null;
     }
-    
+
     async function refreshAccessToken() {
         try {
             log('刷新 access token...');
@@ -330,7 +352,7 @@
         } catch(e) { log('刷新 token 失败:', e.message); }
         return null;
     }
-    
+
     // ============================================================
     // Section 6: Extraction Engine
     // ============================================================
@@ -341,7 +363,7 @@
     const FETCH_COOLDOWN = 5000;
     let isFetchingPrompts = false;
     let _userUploadedFileIds = new Set();
-    
+
     function getOrderedPath(mapping) {
         const childrenOf = {};
         for (const [id, node] of Object.entries(mapping)) {
@@ -371,7 +393,7 @@
         path.sort((a, b) => (mapping[a]?.message?.create_time || 0) - (mapping[b]?.message?.create_time || 0));
         return path;
     }
-    
+
     function extractImageUrlsFromParts(parts, excludeFileIds = _userUploadedFileIds) {
         const urls = [];
         const fileIds = [];
@@ -397,7 +419,7 @@
         }
         return [...new Set(urls)];
     }
-    
+
     function extractFileIdsFromParts(parts) {
         const ids = [];
         for (const part of parts) {
@@ -406,7 +428,7 @@
         }
         return ids;
     }
-    
+
     function isImageInUserMessage(img) {
         const msgEl = img.closest('[data-message-author-role]');
         if (msgEl && msgEl.getAttribute('data-message-author-role') === 'user') return true;
@@ -414,7 +436,7 @@
         if (msgContainer) { if (msgContainer.querySelector('[data-message-author-role="user"]')) return true; }
         return false;
     }
-    
+
     function getAllDomImages(excludeFileIds = _userUploadedFileIds) {
         const mainArea = document.querySelector('#thread') || document.querySelector('main') || document.body;
         const allImgs = [...mainArea.querySelectorAll('img[src^="https"]')];
@@ -430,7 +452,7 @@
         }).map(img => img.src);
         return [...new Set(results)];
     }
-    
+
     function getImagesFromDomByMsgId(msgId, excludeFileIds = _userUploadedFileIds) {
         if (!msgId) return [];
         let el = document.querySelector(`[data-message-id="${msgId}"]`);
@@ -446,7 +468,7 @@
         }
         return [];
     }
-    
+
     function extractPromptsFromCode(codeText) {
         const prompts = [];
         const r1 = /prompt\s*=\s*(?:"""([\s\S]*?)"""|'''([\s\S]*?)''')/g;
@@ -462,7 +484,7 @@
         }
         return prompts;
     }
-    
+
     function buildRounds(conversationData) {
         const mapping = conversationData?.mapping;
         if (!mapping) return { rounds: [], userUploadedFileIds: new Set() };
@@ -471,7 +493,7 @@
         let currentRound = null;
         let lastAssistantMsgId = null;
         const userUploadedFileIds = new Set();
-    
+
         function addPrompt(prompt, source, imageUrls, toolMsgId, fileIds) {
             if (!currentRound) { currentRound = { roundIndex: rounds.length + 1, userText: '...', prompts: [] }; rounds.push(currentRound); }
             const cleaned = prompt.replace(/<\|[a-z_]+\|>/gi, '').replace(/\s+$/, '');
@@ -482,7 +504,7 @@
                 fileIds: fileIds || [], selected: false, toolMsgId, lastAssistantMsgId,
             });
         }
-    
+
         for (const nodeId of path) {
             const node = mapping[nodeId];
             const msg = node?.message;
@@ -491,7 +513,7 @@
             const ct = msg.content?.content_type;
             const parts = msg.content?.parts;
             const msgId = msg.id;
-    
+
             if (role === 'user') {
                 const firstPart = parts?.[0];
                 if (ct === 'user_editable_context') continue;
@@ -511,7 +533,7 @@
             }
             if (role === 'system') continue;
             if (role === 'assistant') lastAssistantMsgId = msgId;
-    
+
             if (role === 'assistant' && ct === 'code' && Array.isArray(parts)) {
                 for (const part of parts) {
                     if (typeof part !== 'string') continue;
@@ -549,7 +571,7 @@
         filtered.forEach((r, i) => r.roundIndex = i + 1);
         return { rounds: filtered, userUploadedFileIds };
     }
-    
+
     function enrichWithDomImages(rounds, conversationData, excludeFileIds = _userUploadedFileIds) {
         const domImgs = getAllDomImages(excludeFileIds);
         const allP = rounds.flatMap(r => r.prompts);
@@ -582,7 +604,7 @@
             for (const item of allP.filter(p => p.imageUrls.length === 0)) { if (idx < unusedDomImgs.length) item.imageUrls = [unusedDomImgs[idx++]]; }
         }
     }
-    
+
     function resolveFileIds(excludeFileIds = _userUploadedFileIds) {
         const allP = allRounds.flatMap(r => r.prompts);
         for (const item of allP) {
@@ -601,17 +623,17 @@
             for (const item of allP) { if (item.imageUrls.length === 0 && idx < unused.length) item.imageUrls = [unused[idx++]]; }
         }
     }
-    
+
     async function fetchAndExtractPrompts(forceRefresh) {
         const convId = getConversationId();
         if (!convId) return;
         const now = Date.now();
         if (!forceRefresh && now - lastFetchTime < FETCH_COOLDOWN) return;
         if (!forceRefresh && convId === lastFetchConvId && allRounds.length > 0) return;
-    
+
         let token = getAccessToken();
         if (!token) { token = await refreshAccessToken(); if (!token) { toast('无法获取 token，请刷新页面'); return; } }
-    
+
         lastFetchTime = now;
         log('请求对话数据:', convId);
         try {
@@ -628,7 +650,7 @@
             }
             if (resp.status === 429) { toast('请求太频繁，请稍后手动重试'); return; }
             if (!resp.ok) { log('API 返回:', resp.status); return; }
-    
+
             const data = await resp.json();
             lastFetchConvId = convId;
             seenPrompts.clear();
@@ -636,18 +658,18 @@
             allRounds = result.rounds;
             _userUploadedFileIds = result.userUploadedFileIds;
             enrichWithDomImages(allRounds, data, _userUploadedFileIds);
-    
+
             const total = allRounds.reduce((s, r) => s + r.prompts.length, 0);
             log(`提取 ${total} 个提示词，${allRounds.length} 轮对话`);
             renderExtractedTab();
-    
+
             const noImgCount = allRounds.flatMap(r => r.prompts).filter(p => p.imageUrls.length === 0).length;
             if (noImgCount > 0) {
                 setTimeout(() => { enrichWithDomImages(allRounds, data, _userUploadedFileIds); renderExtractedTab(); }, 3000);
             }
         } catch(e) { log('请求失败:', e.message); }
     }
-    
+
     async function manualFetchPrompts() {
         if (!getConversationId()) { toast('请先打开一个对话'); return; }
         if (isFetchingPrompts) return;
@@ -657,7 +679,7 @@
         try { await fetchAndExtractPrompts(true); }
         finally { isFetchingPrompts = false; if (refreshBtn) { refreshBtn.disabled = false; refreshBtn.innerHTML = `${SVG.refresh} 提取`; } }
     }
-    
+
     // ============================================================
     // Section 7: Image Download & ZIP
     // ============================================================
@@ -666,7 +688,7 @@
         if (window.JSZip) return window.JSZip;
         return null;
     }
-    
+
     async function downloadImage(url, filename) {
         try {
             const r = await fetch(url, { credentials: 'include' });
@@ -676,7 +698,7 @@
             setTimeout(() => URL.revokeObjectURL(a.href), 3000);
         } catch(e) { window.open(url, '_blank'); }
     }
-    
+
     async function downloadAsZip(urls, zipName) {
         if (!urls.length) { toast('没有可下载的图片'); return; }
         try {
@@ -701,7 +723,7 @@
             toast(`已打包 ${done} 张图片`);
         } catch(e) { log('ZIP 打包失败:', e.message); toast('打包失败'); }
     }
-    
+
     // ============================================================
     // Section 8: SVG Icons
     // ============================================================
@@ -719,7 +741,7 @@
         pin: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>`,
         unpin: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="2" y1="2" x2="22" y2="22"/><path d="M17 17H5v-1.76a2 2 0 0 1 1.11-1.79l1.78-.9A2 2 0 0 0 9 10.76V6h1"/><path d="M7 2h10a2 2 0 0 1 0 4h-1v4.76a2 2 0 0 0 1.11 1.79l1.78.9A2 2 0 0 1 19 15.24V17"/></svg>`,
     };
-    
+
     // ============================================================
     // Section 9: UI - Styles
     // ============================================================
@@ -741,7 +763,7 @@
         --gpt-suite-shadow:0 18px 50px rgba(0,0,0,.16),0 0 0 1px rgba(0,0,0,.06);
         --gpt-suite-shadow-soft:0 8px 28px rgba(0,0,0,.12);
     }
-    
+
     /* ---- Shared shell ---- */
     #gpt-panel,#gpt-fab,.gpt-toast,.pm-modal-overlay{
         --suite-bg:var(--main-surface-primary,#fff);
@@ -806,7 +828,7 @@
         outline:2px solid var(--suite-focus);
         outline-offset:2px;
     }
-    
+
     /* Native-feeling launcher */
     #gpt-fab{
         position:fixed;
@@ -852,7 +874,7 @@
         font-weight:700;
         line-height:1;
     }
-    
+
     /* Tabs */
     .gpt-tabs{
         display:flex;
@@ -908,7 +930,7 @@
     .gpt-close:hover,.gpt-mode-btn:hover{background:var(--suite-bg-hover);color:var(--suite-text)}
     .gpt-mode-btn.active{color:var(--gpt-suite-accent);background:rgba(16,163,127,.1)}
     .gpt-close:active,.gpt-mode-btn:active{transform:scale(.96)}
-    
+
     /* Toast */
     .gpt-toast{
         position:fixed;
@@ -929,7 +951,7 @@
         transition:opacity .22s ease,transform .22s ease;
     }
     .gpt-toast.show{opacity:1;transform:translateX(-50%) translateY(0) scale(1)}
-    
+
     /* ---- Extracted Tab ---- */
     .rp-hdr{
         display:flex;
@@ -1230,7 +1252,7 @@
         text-align:center;
         font-size:13px;
     }
-    
+
     /* ---- Library Tab ---- */
     .pm-search-bar{
         padding:12px 14px;
@@ -1242,7 +1264,7 @@
         width:100%;
         border:1px solid var(--suite-border);
         border-radius:12px;
-        background:var(--suite-bg-soft);
+        background-color:var(--suite-bg-soft);
         color:var(--suite-text);
         padding:10px 12px;
         font-size:13px;
@@ -1294,6 +1316,48 @@
     .pm-cat-del:hover{opacity:1;color:var(--gpt-suite-danger)}
     .pm-cat-btn.pm-active .pm-cat-del:hover{color:currentColor}
     .pm-cat-add{border-style:dashed;background:transparent;color:var(--suite-text-faint)}
+    .pm-cat-label{display:inline-flex;align-items:center;gap:5px;transform-origin:center center}
+    .pm-cat-btn.pm-cat-draggable{cursor:grab;transition:transform .2s ease,box-shadow .2s ease}
+    .pm-cat-btn.pm-cat-draggable:active{cursor:grabbing}
+    .pm-cat-btn.pm-cat-source{display:none !important}
+    .pm-cat-btn.pm-cat-lifted{
+        position:fixed !important;
+        margin:0 !important;
+        z-index:100003;
+        pointer-events:none;
+        opacity:.99;
+        background:var(--suite-bg);
+        border-color:rgba(16,163,127,.58);
+        box-shadow:0 18px 38px rgba(0,0,0,.22),0 0 0 1px rgba(16,163,127,.18);
+        transform:translate3d(var(--pm-cat-dx,0px),var(--pm-cat-dy,0px),0) scale(1.05) rotate(var(--pm-cat-rotate,.35deg));
+        transform-origin:center center;
+        will-change:transform;
+        transition:box-shadow .18s ease,border-color .18s ease,opacity .18s ease;
+    }
+    html.dark .pm-cat-btn.pm-cat-lifted{box-shadow:0 20px 42px rgba(0,0,0,.54),0 0 0 1px rgba(16,163,127,.28)}
+    .pm-categories.pm-cat-reordering .pm-cat-btn.pm-cat-draggable:not(.pm-cat-lifted):not(.pm-cat-source){
+        transition:transform .34s cubic-bezier(.16,1,.3,1),box-shadow .18s ease,border-color .18s ease;
+    }
+    .pm-categories.pm-cat-reordering .pm-cat-btn.pm-cat-draggable:not(.pm-cat-lifted):not(.pm-cat-source) .pm-cat-label{
+        animation:pmCatJiggle .62s ease-in-out infinite alternate;
+        animation-delay:var(--pm-cat-jiggle-delay,0ms);
+    }
+    .pm-cat-btn.pm-cat-shifting{z-index:1}
+    .pm-cat-placeholder{height:28px;display:inline-flex;flex-shrink:0;border:1px dashed rgba(16,163,127,.38);border-radius:12px;
+        background:linear-gradient(90deg,rgba(16,163,127,.075),rgba(16,163,127,.04));
+        transition:width .24s cubic-bezier(.16,1,.3,1),transform .24s cubic-bezier(.16,1,.3,1)}
+    html.dark .pm-cat-placeholder{background:rgba(16,163,127,.12);border-color:rgba(16,163,127,.42)}
+    .pm-cat-btn.pm-cat-drop-pop{animation:pmCatDropPop .32s cubic-bezier(.2,1.25,.2,1)}
+    @keyframes pmCatJiggle{
+        0%{transform:translate3d(-.35px,0,0) rotate(-.22deg)}
+        50%{transform:translate3d(.25px,-.25px,0) rotate(.12deg)}
+        100%{transform:translate3d(.35px,.15px,0) rotate(.24deg)}
+    }
+    @keyframes pmCatDropPop{
+        0%{transform:scale(1.08)}
+        58%{transform:scale(.96)}
+        100%{transform:scale(1)}
+    }
     .pm-item{
         position:relative;
         padding:14px;
@@ -1344,6 +1408,88 @@
         font-size:12px;
         line-height:1.6;
     }
+    .pm-item-preview:hover{overflow-y:auto;scrollbar-width:none}
+    .pm-item-preview:hover::-webkit-scrollbar{display:none}
+
+    /* iOS-like whole-card drag animation */
+    .pm-item{
+        cursor:grab;
+        user-select:none;
+        -webkit-user-select:none;
+        touch-action:pan-y;
+        will-change:transform;
+    }
+    .pm-item:active{cursor:grabbing}
+    .pm-item-inner{
+        transform-origin:center center;
+        will-change:transform;
+    }
+    .pm-list.pm-reordering{
+        user-select:none;
+        -webkit-user-select:none;
+    }
+    .pm-list.pm-reordering .pm-item:not(.pm-lifted){
+        transition:transform .34s cubic-bezier(.16,1,.3,1),box-shadow .18s ease,border-color .18s ease,background .18s ease;
+    }
+    .pm-list.pm-reordering .pm-item:not(.pm-lifted) .pm-item-inner{
+        animation:pmNeighborJiggle .62s ease-in-out infinite alternate;
+        animation-delay:var(--pm-jiggle-delay,0ms);
+    }
+    .pm-list.pm-reordering .pm-item.pm-shifting{
+        z-index:1;
+    }
+
+    .pm-item.pm-drag-source{
+        display:none !important;
+    }
+    .pm-item.pm-lifted{
+        position:fixed !important;
+        margin:0 !important;
+        z-index:100003;
+        pointer-events:none;
+        cursor:grabbing;
+        opacity:.99;
+        border-color:rgba(16,163,127,.58);
+        background:var(--suite-bg);
+        box-shadow:0 28px 64px rgba(0,0,0,.24),0 0 0 1px rgba(16,163,127,.18);
+        transform:translate3d(var(--pm-drag-x,0px),var(--pm-drag-y,0px),0) scale(1.035) rotate(var(--pm-drag-rotate,.45deg));
+        transform-origin:center center;
+        will-change:transform,left,top;
+        transition:box-shadow .18s ease,border-color .18s ease,opacity .18s ease,filter .18s ease;
+        filter:saturate(1.02);
+    }
+    .pm-item.pm-lifted .pm-item-inner{
+        animation:pmLiftedJiggle .46s ease-in-out infinite alternate;
+    }
+    html.dark .pm-item.pm-lifted{box-shadow:0 30px 68px rgba(0,0,0,.56),0 0 0 1px rgba(16,163,127,.28)}
+    .pm-drag-placeholder{
+        margin-bottom:10px;
+        border:1px dashed rgba(16,163,127,.38);
+        border-radius:16px;
+        background:linear-gradient(180deg,rgba(16,163,127,.075),rgba(16,163,127,.04));
+        box-shadow:inset 0 0 0 1px rgba(16,163,127,.04);
+        transition:height .24s cubic-bezier(.16,1,.3,1),transform .24s cubic-bezier(.16,1,.3,1),opacity .18s ease;
+    }
+    html.dark .pm-drag-placeholder{background:rgba(16,163,127,.12);border-color:rgba(16,163,127,.42)}
+    .pm-item.pm-drop-pop{animation:pmDropPop .32s cubic-bezier(.2,1.25,.2,1)}
+    .pm-item.pm-drop-pop .pm-item-inner{animation:none}
+    @keyframes pmNeighborJiggle{
+        0%{transform:translate3d(-.35px,0,0) rotate(-.22deg)}
+        50%{transform:translate3d(.25px,-.25px,0) rotate(.12deg)}
+        100%{transform:translate3d(.35px,.15px,0) rotate(.24deg)}
+    }
+    @keyframes pmLiftedJiggle{
+        0%{transform:rotate(-.38deg)}
+        100%{transform:rotate(.48deg)}
+    }
+    @keyframes pmDropPop{
+        0%{transform:scale(1.018)}
+        58%{transform:scale(.99)}
+        100%{transform:scale(1)}
+    }
+    .pm-fav-divider{display:flex;align-items:center;gap:8px;margin:8px 0;font-size:11px;
+        font-weight:600;color:var(--suite-text-muted);user-select:none}
+    .pm-fav-divider::before,.pm-fav-divider::after{content:'';flex:1;height:1px;background:var(--suite-border)}
     .pm-item-meta{
         display:flex;
         flex-direction:column;
@@ -1443,7 +1589,7 @@
     .pm-export-btn{padding:0 14px;background:var(--suite-bg);color:var(--suite-text)}
     .pm-add-btn:hover,.pm-export-btn:hover{box-shadow:0 5px 16px rgba(0,0,0,.1)}
     .pm-export-btn:hover{background:var(--suite-bg-hover);border-color:var(--suite-border-strong)}
-    
+
     /* ---- Modal ---- */
     .pm-modal-overlay{
         position:fixed;
@@ -1483,6 +1629,120 @@
     }
     .pm-modal textarea{min-height:112px;resize:vertical;line-height:1.55}
     .pm-modal input,.pm-modal textarea,.pm-modal select{margin-bottom:13px}
+    .pm-modal select.pm-select-native{display:none}
+    .pm-select{
+        position:relative;
+        z-index:2;
+        margin-bottom:13px;
+    }
+    .pm-select.pm-open{z-index:30}
+    .pm-select-trigger{
+        width:100%;
+        min-height:42px;
+        padding:0 12px 0 13px;
+        border:1px solid var(--suite-border);
+        border-radius:12px;
+        background:
+            linear-gradient(180deg,rgba(255,255,255,.035),rgba(16,163,127,.025)),
+            var(--suite-bg-soft);
+        color:var(--suite-text);
+        cursor:pointer;
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:10px;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.04);
+        transition:border-color .16s ease,box-shadow .16s ease,background .16s ease,transform .12s ease;
+    }
+    .pm-select-trigger:hover{
+        border-color:var(--suite-border-strong);
+        background:var(--suite-bg-hover);
+    }
+    .pm-select.pm-open .pm-select-trigger{
+        border-color:rgba(16,163,127,.56);
+        background:var(--suite-bg);
+        box-shadow:0 0 0 4px var(--suite-focus),0 8px 22px rgba(0,0,0,.08);
+    }
+    .pm-select-value{
+        min-width:0;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+        font-size:13px;
+        font-weight:650;
+    }
+    .pm-select-arrow{
+        width:24px;
+        height:24px;
+        border-radius:999px;
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+        color:var(--suite-text-muted);
+        background:rgba(16,163,127,.08);
+        transition:transform .16s ease,color .16s ease,background .16s ease;
+    }
+    .pm-select.pm-open .pm-select-arrow{
+        transform:rotate(180deg);
+        color:var(--suite-text);
+        background:rgba(16,163,127,.14);
+    }
+    .pm-select-menu{
+        position:absolute;
+        left:0;
+        right:0;
+        top:calc(100% + 7px);
+        max-height:188px;
+        overflow:auto;
+        padding:6px;
+        border:1px solid var(--suite-border);
+        border-radius:14px;
+        background:var(--suite-bg);
+        box-shadow:0 18px 48px rgba(0,0,0,.18),0 0 0 1px rgba(16,163,127,.04);
+        opacity:0;
+        transform:translateY(-4px) scale(.985);
+        pointer-events:none;
+        transform-origin:top center;
+        transition:opacity .14s ease,transform .16s cubic-bezier(.16,1,.3,1);
+    }
+    .pm-select.pm-open .pm-select-menu{
+        opacity:1;
+        transform:translateY(0) scale(1);
+        pointer-events:auto;
+    }
+    .pm-select-option{
+        width:100%;
+        min-height:34px;
+        padding:0 10px;
+        border:1px solid transparent;
+        border-radius:10px;
+        background:transparent;
+        color:var(--suite-text-muted);
+        cursor:pointer;
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:10px;
+        font-size:13px;
+        font-weight:600;
+        text-align:left;
+    }
+    .pm-select-option:hover,.pm-select-option:focus-visible{
+        background:var(--suite-bg-hover);
+        color:var(--suite-text);
+        outline:none;
+    }
+    .pm-select-option.pm-selected{
+        border-color:rgba(16,163,127,.22);
+        background:rgba(16,163,127,.1);
+        color:var(--suite-text);
+    }
+    .pm-select-check{
+        color:var(--gpt-suite-accent);
+        font-size:12px;
+        opacity:0;
+    }
+    .pm-select-option.pm-selected .pm-select-check{opacity:1}
     .pm-modal-btns{
         display:flex;
         justify-content:flex-end;
@@ -1534,7 +1794,7 @@
     .pm-conflict-btn:hover{border-color:#10a37f;color:#10a37f}
     .pm-conflict-btn.pm-conflict-active{background:#10a37f;border-color:#10a37f;color:#fff}
     .pm-conflict-hint{font-size:12px;color:var(--suite-text-muted);text-align:center;padding:16px 0}
-    
+
     /* ---- Floating mode overrides ---- */
     #gpt-panel.gpt-floating{
         position:fixed;
@@ -1612,11 +1872,11 @@
         }
         #gpt-fab{right:16px;bottom:72px}
     }
-    
+
             `;
         document.head.appendChild(s);
     }
-    
+
     // ============================================================
     // Section 10: UI - Toast
     // ============================================================
@@ -1627,7 +1887,7 @@
         clearTimeout(t._timer);
         t._timer = setTimeout(() => t.classList.remove('show'), 2000);
     }
-    
+
     // ============================================================
     // Section 11: UI - FAB
     // ============================================================
@@ -1641,7 +1901,7 @@
         fab.onclick = () => togglePanel();
         document.body.appendChild(fab);
     }
-    
+
     function updateFab() {
         const fab = document.getElementById(Config.FAB_ID);
         if (!fab) return;
@@ -1652,10 +1912,10 @@
             fab.appendChild(b);
         }
     }
-    
+
     let panelVisible = false;
     let activeTab = 'extracted';
-    
+
     function togglePanel(force) {
         const panel = document.getElementById(Config.PANEL_ID);
         if (!panel) return;
@@ -1666,7 +1926,7 @@
             else LibraryUI.render();
         }
     }
-    
+
     function switchTab(tabName) {
         activeTab = tabName;
         document.querySelectorAll('.gpt-tab').forEach(t => t.classList.toggle('gpt-active', t.dataset.tab === tabName));
@@ -1674,20 +1934,20 @@
         if (tabName === 'extracted') renderExtractedTab();
         else LibraryUI.render();
     }
-    
+
     let panelMode = 'docked'; // 'docked' | 'floating'
-    
+
     async function togglePanelMode() {
         panelMode = panelMode === 'docked' ? 'floating' : 'docked';
         applyPanelMode();
         await GM_setValue(Config.MODE_KEY, panelMode);
     }
-    
+
     function applyPanelMode() {
         const panel = document.getElementById(Config.PANEL_ID);
         const btn = document.getElementById('gpt-mode-btn');
         if (!panel) return;
-    
+
         if (panelMode === 'floating') {
             // Floating: detach from content row, append to body
             if (panel.parentElement !== document.body) {
@@ -1703,14 +1963,14 @@
             }
             panel.classList.remove('gpt-floating');
         }
-    
+
         if (btn) {
             btn.innerHTML = panelMode === 'floating' ? SVG.unpin : SVG.pin;
             btn.title = panelMode === 'floating' ? '切换为停靠模式' : '切换为悬浮模式';
             btn.classList.toggle('active', panelMode === 'floating');
         }
     }
-    
+
     // ============================================================
     // Section 12: UI - Panel Shell
     // ============================================================
@@ -1761,24 +2021,24 @@
         } else {
             document.body.appendChild(panel); // fallback
         }
-    
+
         // Tab switching
         panel.querySelectorAll('.gpt-tab').forEach(tab => {
             tab.addEventListener('click', () => switchTab(tab.dataset.tab));
         });
-    
+
         // Close
         document.getElementById('gpt-close').addEventListener('click', () => togglePanel(false));
-    
+
         // Mode toggle (docked vs floating)
         document.getElementById('gpt-mode-btn').addEventListener('click', () => togglePanelMode());
-    
+
         // Extracted tab events
         document.getElementById('gpt-refresh').addEventListener('click', manualFetchPrompts);
         document.getElementById('rp-sel-all').addEventListener('click', toggleSelectAll);
         document.getElementById('rp-dl-sel').addEventListener('click', downloadSelected);
         document.getElementById('rp-dl-all').addEventListener('click', downloadAll);
-    
+
         // Library tab events
         document.getElementById('pm-btn-add').addEventListener('click', () => LibraryUI.showEditModal());
         document.getElementById('pm-btn-import').addEventListener('click', () => {
@@ -1794,7 +2054,7 @@
         });
         document.getElementById('pm-file-input').addEventListener('change', e => LibraryUI._handleImport(e));
     }
-    
+
     // ============================================================
     // Section 13: UI - Extracted Tab
     // ============================================================
@@ -1807,7 +2067,7 @@
         document.getElementById('rp-sel-all').textContent = allSelected ? '全选' : '取消全选';
         updateExtractedFooter();
     }
-    
+
     function updateExtractedFooter() {
         const allP = allRounds.flatMap(r => r.prompts);
         const selCount = allP.filter(p => p.selected).length;
@@ -1818,32 +2078,32 @@
         const countEl = document.getElementById('rp-count');
         if (countEl) countEl.textContent = allP.length + ' 条';
     }
-    
+
     async function downloadSelected() {
         const selP = allRounds.flatMap(r => r.prompts).filter(p => p.selected);
         const urls = selP.flatMap(p => p.imageUrls);
         if (!urls.length) return;
         await downloadAsZip(urls, `chatgpt-selected-${urls.length}imgs.zip`);
     }
-    
+
     async function downloadAll() {
         const urls = allRounds.flatMap(r => r.prompts).flatMap(p => p.imageUrls);
         if (!urls.length) { toast('没有可下载的图片'); return; }
         await downloadAsZip(urls, `chatgpt-all-${urls.length}imgs.zip`);
     }
-    
+
     function renderExtractedTab() {
         resolveFileIds();
         const body = document.getElementById('rp-body');
         if (!body) return;
         body.innerHTML = '';
-    
+
         if (allRounds.length === 0) {
             body.innerHTML = '<div class="rp-empty">点击右上角「提取」按钮获取当前对话的优化提示词</div>';
             updateFab(); updateExtractedFooter();
             return;
         }
-    
+
         let globalIdx = 0;
         for (const round of allRounds) {
             if (!round.prompts.length) continue;
@@ -1863,13 +2123,13 @@
         }
         updateFab(); updateExtractedFooter();
     }
-    
+
     function buildExtractedCard(item, index) {
         const card = document.createElement('div');
         card.className = 'rp-card' + (item.selected ? ' selected' : '');
         card.dataset.id = item.id;
         const preview = item.prompt.substring(0, 55).replace(/\n/g, ' ') + (item.prompt.length > 55 ? '...' : '');
-    
+
         let thumbsHtml = '';
         if (item.imageUrls.length > 0) {
             thumbsHtml = '<div class="rp-thumb-strip">';
@@ -1880,7 +2140,7 @@
         } else {
             thumbsHtml = `<div class="rp-thumb-ph">${SVG.img}</div>`;
         }
-    
+
         card.innerHTML = `
             <div class="rp-card-hdr">
                 <input type="checkbox" class="rp-cb" ${item.selected ? 'checked' : ''}>
@@ -1899,11 +2159,11 @@
                     ${item.imageUrls.length > 0 ? `<button class="rp-dl-btn">${SVG.download} 下载图片</button>` : ''}
                 </div>
             </div>`;
-    
+
         const hdr = card.querySelector('.rp-card-hdr');
         const cb = card.querySelector('.rp-cb');
         cb.onclick = e => { e.stopPropagation(); item.selected = cb.checked; card.classList.toggle('selected', cb.checked); updateExtractedFooter(); };
-    
+
         // Thumbnail hover preview
         card.querySelectorAll('.rp-thumb').forEach(thumb => {
             const previewUrl = thumb.dataset.previewUrl;
@@ -1919,9 +2179,9 @@
             thumb.addEventListener('mouseleave', () => { if (previewEl) previewEl.classList.remove('show'); });
             thumb.addEventListener('click', e => { e.stopPropagation(); if (previewUrl) window.open(previewUrl, '_blank'); });
         });
-    
+
         hdr.onclick = e => { if (e.target === cb || e.target.classList?.contains('rp-thumb')) return; card.classList.toggle('open'); };
-    
+
         // Copy
         const copyBtn = card.querySelector('.rp-copy-btn');
         copyBtn.onclick = e => {
@@ -1930,7 +2190,7 @@
             copyBtn.classList.add('ok'); copyBtn.innerHTML = SVG.check + ' 已复制'; toast('已复制到剪贴板');
             setTimeout(() => { copyBtn.classList.remove('ok'); copyBtn.innerHTML = SVG.copy + ' 复制'; }, 1500);
         };
-    
+
         // Save to Library
         const saveBtn = card.querySelector('.rp-save-btn');
         saveBtn.onclick = e => {
@@ -1945,7 +2205,7 @@
             saveBtn.classList.add('saved'); saveBtn.innerHTML = SVG.check + ' 已存';
             setTimeout(() => { saveBtn.classList.remove('saved'); saveBtn.innerHTML = SVG.save + ' 存到库'; }, 2000);
         };
-    
+
         // Download image
         const dlBtn = card.querySelector('.rp-dl-btn');
         if (dlBtn) dlBtn.onclick = async e => {
@@ -1953,10 +2213,10 @@
             toast(`下载 ${item.imageUrls.length} 张图片...`);
             for (let i = 0; i < item.imageUrls.length; i++) { await downloadImage(item.imageUrls[i], `chatgpt-img-${i+1}.png`); await new Promise(r => setTimeout(r, 300)); }
         };
-    
+
         return card;
     }
-    
+
     // ============================================================
     // Section 14: UI - Library Tab
     // ============================================================
@@ -1966,19 +2226,24 @@
         _searchKeyword: '',
         _activeCategory: '全部',
         _editingId: null,
-    
+        _frequentOrder: [],
+        _catOrder: [],
+        _dragState: null,
+
         async init() {
             this._prompts = await StorageService.load();
+            this._frequentOrder = await StorageService.loadFrequentOrder();
+            this._catOrder = await StorageService.loadCategoryOrder();
             this._categories = await StorageService.loadCategories();
         },
-    
+
         _getCategoryList() {
             // Merge stored categories with any categories found in prompts
             const fromPrompts = new Set(this._prompts.map(p => p.category).filter(Boolean));
             const merged = [...new Set([...this._categories, ...fromPrompts])];
             return merged;
         },
-    
+
         async _addCategory(name) {
             name = name.trim();
             if (!name) return;
@@ -1987,24 +2252,33 @@
             await StorageService.saveCategories(this._categories);
             this.renderCategories();
         },
-    
+
         async _deleteCategory(name) {
-            const count = this._prompts.filter(p => p.category === name).length;
+            const promptsInCat = this._prompts.filter(p => p.category === name);
+            const count = promptsInCat.length;
             if (count > 0) {
-                if (!confirm(`分类「${name}」下有 ${count} 条提示词，删除后这些提示词的分类不会改变。确定删除？`)) return;
+                const titles = promptsInCat.slice(0, 5).map(p => `· ${p.title}`).join('\n');
+                const more = count > 5 ? `\n...及其他 ${count - 5} 条` : '';
+                if (!confirm(`确定删除分类「${name}」？\n\n该分类下的 ${count} 条提示词将一并删除：\n${titles}${more}\n\n此操作不可撤销。`)) return;
             }
+            if (count === 0) {
+                if (!confirm(`确定删除分类「${name}」？`)) return;
+            }
+            this._prompts = this._prompts.filter(p => p.category !== name);
             this._categories = this._categories.filter(c => c !== name);
+            await StorageService.save(this._prompts);
             await StorageService.saveCategories(this._categories);
             if (this._activeCategory === name) this._activeCategory = '全部';
             this.renderCategories();
             this.renderList();
+            toast(`已删除分类「${name}」及 ${count} 条提示词`);
         },
-    
+
         render() {
             this.renderCategories();
             this.renderList();
         },
-    
+
         _getFrequentPrompts(limit = 10) {
             const now = Date.now();
             const scored = this._prompts
@@ -2022,18 +2296,32 @@
         renderCategories() {
             const container = document.getElementById('pm-categories');
             if (!container) return;
-            const cats = ['全部', '常用', ...this._getCategoryList()];
-            const uniqueCats = [...new Set(cats)];
 
-            let html = uniqueCats.map(c => {
+            // Fixed tabs first, then custom-ordered categories
+            const fixedCats = ['常用', '全部'];
+            const allCats = this._getCategoryList();
+            // Apply saved order to non-fixed categories
+            const orderedCats = [];
+            for (const c of this._catOrder) {
+                if (allCats.includes(c) && !fixedCats.includes(c)) orderedCats.push(c);
+            }
+            for (const c of allCats) {
+                if (!fixedCats.includes(c) && !orderedCats.includes(c)) orderedCats.push(c);
+            }
+
+            const renderCat = (c, isDraggable) => {
                 const isActive = c === this._activeCategory;
-                const canDelete = c !== '全部' && c !== '常用';
-                return `<span class="pm-cat-btn${isActive ? ' pm-active' : ''}" data-cat="${c}">${c}${canDelete ? '<button class="pm-cat-del" data-cat="' + c + '" title="删除分类">×</button>' : ''}</span>`;
-            }).join('');
+                const canDelete = !fixedCats.includes(c);
+                return `<span class="pm-cat-btn${isActive ? ' pm-active' : ''}${isDraggable ? ' pm-cat-draggable' : ''}" data-cat="${c}"><span class="pm-cat-label">${escHtml(c)}${canDelete ? '<button class="pm-cat-del" data-cat="' + c + '" title="删除分类">×</button>' : ''}</span></span>`;
+            };
+
+            let html = fixedCats.map(c => renderCat(c, false)).join('');
+            html += orderedCats.map(c => renderCat(c, true)).join('');
             html += '<button class="pm-cat-add" id="pm-cat-add" title="新增分类">+ </button>';
-    
+
             container.innerHTML = html;
-    
+
+            // Click handlers
             container.querySelectorAll('[data-cat]').forEach(btn => {
                 if (btn.classList.contains('pm-cat-del')) return;
                 btn.addEventListener('click', e => {
@@ -2043,20 +2331,286 @@
                     this.renderList();
                 });
             });
-    
+
             container.querySelectorAll('.pm-cat-del').forEach(btn => {
                 btn.addEventListener('click', e => {
                     e.stopPropagation();
                     this._deleteCategory(btn.dataset.cat);
                 });
             });
-    
+
             document.getElementById('pm-cat-add')?.addEventListener('click', () => {
                 const name = prompt('请输入新分类名称：');
                 if (name) this._addCategory(name);
             });
+
+            // Drag reordering for non-fixed categories
+            this._bindCatDragEvents(container);
         },
-    
+
+        _bindCatDragEvents(container) {
+            if (container._pmCatDragCleanup) container._pmCatDragCleanup();
+
+            const MOVE_THRESHOLD = 6;
+            let drag = null;
+            let raf = 0;
+            let suppressClick = false;
+
+            const clearFrame = () => { if (raf) cancelAnimationFrame(raf); raf = 0; };
+
+            const getDraggableItems = () => [...container.querySelectorAll('.pm-cat-btn.pm-cat-draggable:not(.pm-cat-lifted):not(.pm-cat-source)')];
+
+            const setGhostTransform = (dx, dy, ghost = drag?.ghost) => {
+                if (!ghost) return;
+                ghost.style.setProperty('--pm-cat-dx', `${dx}px`);
+                ghost.style.setProperty('--pm-cat-dy', `${dy}px`);
+                ghost.style.setProperty('--pm-cat-rotate', `${Math.max(-0.8, Math.min(0.8, dx / 180))}deg`);
+            };
+
+            const applyJiggleDelays = () => {
+                getDraggableItems().forEach((el, i) => {
+                    el.style.setProperty('--pm-cat-jiggle-delay', `${-(i % 5) * 84}ms`);
+                });
+            };
+
+            const animateLayoutShift = (mutate) => {
+                const items = getDraggableItems();
+                const first = new Map(items.map(el => [el, el.getBoundingClientRect()]));
+                mutate();
+                const shifted = [];
+                for (const el of items) {
+                    if (!el.isConnected) continue;
+                    const before = first.get(el);
+                    const after = el.getBoundingClientRect();
+                    const dx = before.left - after.left;
+                    const dy = before.top - after.top;
+                    if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) continue;
+                    el.classList.add('pm-cat-shifting');
+                    el.style.transition = 'none';
+                    el.style.transform = `translate3d(${dx}px,${dy}px,0)`;
+                    shifted.push(el);
+                }
+                if (!shifted.length) return;
+                requestAnimationFrame(() => {
+                    shifted.forEach(el => {
+                        el.style.transition = 'transform .34s cubic-bezier(.16,1,.3,1)';
+                        el.style.transform = '';
+                    });
+                    setTimeout(() => shifted.forEach(el => {
+                        el.classList.remove('pm-cat-shifting');
+                        el.style.transition = '';
+                        el.style.transform = '';
+                    }), 380);
+                });
+            };
+
+            const movePlaceholder = (clientX, clientY) => {
+                if (!drag?.placeholder) return;
+                const items = getDraggableItems();
+                const beforeEl = items.find(el => {
+                    const r = el.getBoundingClientRect();
+                    const sameRow = clientY >= r.top - 4 && clientY <= r.bottom + 4;
+                    return (sameRow && clientX < r.left + r.width / 2) || clientY < r.top + r.height / 2;
+                }) || null;
+                const currentNext = drag.placeholder.nextElementSibling;
+                const addButton = container.querySelector('.pm-cat-add');
+                if (beforeEl === currentNext || (!beforeEl && currentNext === addButton)) return;
+                animateLayoutShift(() => {
+                    if (beforeEl) container.insertBefore(drag.placeholder, beforeEl);
+                    else container.insertBefore(drag.placeholder, addButton);
+                });
+            };
+
+            const startDrag = (e) => {
+                const source = drag.item;
+                const rect = source.getBoundingClientRect();
+
+                const placeholder = document.createElement('span');
+                placeholder.className = 'pm-cat-placeholder';
+                placeholder.style.width = `${rect.width}px`;
+                placeholder.style.height = `${rect.height}px`;
+                source.parentNode.insertBefore(placeholder, source);
+
+                const ghost = source.cloneNode(true);
+                ghost.classList.add('pm-cat-lifted');
+                ghost.removeAttribute('id');
+                ghost.style.left = `${rect.left}px`;
+                ghost.style.top = `${rect.top}px`;
+                ghost.style.width = `${rect.width}px`;
+                ghost.style.height = `${rect.height}px`;
+                ghost.style.transition = 'box-shadow .18s ease,border-color .18s ease';
+                document.body.appendChild(ghost);
+
+                source.classList.add('pm-cat-source');
+
+                drag.rect = rect;
+                drag.ghost = ghost;
+                drag.placeholder = placeholder;
+                drag.started = true;
+                suppressClick = true;
+                drag.offsetX = e.clientX - rect.left;
+                drag.offsetY = e.clientY - rect.top;
+
+                setGhostTransform(0, 0);
+                container.classList.add('pm-cat-reordering');
+                applyJiggleDelays();
+            };
+
+            const onPointerDown = (e) => {
+                if (e.button !== undefined && e.button !== 0) return;
+                if (e.target.closest('button,input,textarea,select')) return;
+                const item = e.target.closest('.pm-cat-btn.pm-cat-draggable');
+                if (!item || !container.contains(item)) return;
+                drag = {
+                    item,
+                    ghost: null,
+                    pointerId: e.pointerId,
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    rect: item.getBoundingClientRect(),
+                    started: false,
+                    placeholder: null,
+                    offsetX: 0,
+                    offsetY: 0,
+                };
+                item.setPointerCapture?.(e.pointerId);
+            };
+
+            const onPointerMove = (e) => {
+                if (!drag) return;
+                const dx = e.clientX - drag.startX;
+                const dy = e.clientY - drag.startY;
+                if (!drag.started) {
+                    if (Math.hypot(dx, dy) < MOVE_THRESHOLD) return;
+                    startDrag(e);
+                }
+                e.preventDefault();
+                clearFrame();
+                raf = requestAnimationFrame(() => {
+                    setGhostTransform(dx, dy);
+                    movePlaceholder(e.clientX, e.clientY);
+                });
+            };
+
+            const waitForTransition = (el, propertyName, fallback = 240) => new Promise(resolve => {
+                let done = false;
+                const finish = () => {
+                    if (done) return;
+                    done = true;
+                    el.removeEventListener('transitionend', onEnd);
+                    resolve();
+                };
+                const onEnd = (ev) => {
+                    if (ev.target === el && (!propertyName || ev.propertyName === propertyName)) finish();
+                };
+                el.addEventListener('transitionend', onEnd);
+                setTimeout(finish, fallback);
+            });
+
+            const finishDrag = async (shouldSave = true) => {
+                if (!drag) return;
+                clearFrame();
+                const state = drag;
+                drag = null;
+
+                const source = state.item;
+                try { source.releasePointerCapture?.(state.pointerId); } catch(e) {}
+
+                if (!state.started) return;
+
+                const ghost = state.ghost;
+                const placeholder = state.placeholder;
+                const targetRect = placeholder.getBoundingClientRect();
+                const dx = targetRect.left - state.rect.left;
+                const dy = targetRect.top - state.rect.top;
+
+                ghost.style.transition = 'transform .19s cubic-bezier(.2,.9,.2,1),box-shadow .19s ease,opacity .16s ease';
+                setGhostTransform(dx, dy, ghost);
+
+                await waitForTransition(ghost, 'transform', 230);
+
+                const firstRects = new Map(getDraggableItems().map(el => [el, el.getBoundingClientRect()]));
+                placeholder.parentNode.insertBefore(source, placeholder);
+                source.classList.remove('pm-cat-source');
+                source.classList.add('pm-cat-drop-pop');
+                placeholder.remove();
+
+                requestAnimationFrame(() => {
+                    for (const [el, before] of firstRects) {
+                        if (!el.isConnected || el === source) continue;
+                        const after = el.getBoundingClientRect();
+                        const shiftX = before.left - after.left;
+                        const shiftY = before.top - after.top;
+                        if (Math.abs(shiftX) < 0.5 && Math.abs(shiftY) < 0.5) continue;
+                        el.style.transition = 'none';
+                        el.style.transform = `translate3d(${shiftX}px,${shiftY}px,0)`;
+                        requestAnimationFrame(() => {
+                            el.style.transition = 'transform .28s cubic-bezier(.16,1,.3,1)';
+                            el.style.transform = '';
+                        });
+                    }
+                    requestAnimationFrame(() => ghost.remove());
+                });
+                setTimeout(() => {
+                    container.classList.remove('pm-cat-reordering');
+                    getDraggableItems().forEach(el => {
+                        el.style.removeProperty('--pm-cat-jiggle-delay');
+                        el.style.transform = '';
+                        el.style.transition = '';
+                        el.classList.remove('pm-cat-shifting');
+                    });
+                    source.classList.remove('pm-cat-drop-pop');
+                }, 360);
+
+                if (shouldSave) {
+                    const newOrder = [...container.querySelectorAll('.pm-cat-btn.pm-cat-draggable:not(.pm-cat-lifted):not(.pm-cat-source)')].map(el => el.dataset.cat);
+                    const saveOrder = async () => {
+                        this._catOrder = newOrder;
+                        await StorageService.saveCategoryOrder(newOrder);
+                    };
+                    if (window.requestIdleCallback) window.requestIdleCallback(() => saveOrder().catch(e => log('保存分类排序失败:', e)), { timeout: 1000 });
+                    else setTimeout(() => saveOrder().catch(e => log('保存分类排序失败:', e)), 260);
+                }
+                setTimeout(() => { suppressClick = false; }, 0);
+            };
+
+            const onPointerUp = () => finishDrag(true);
+            const onPointerCancel = () => finishDrag(false);
+            const onClickCapture = (e) => {
+                if (!suppressClick) return;
+                suppressClick = false;
+                e.preventDefault();
+                e.stopPropagation();
+            };
+
+            container.addEventListener('pointerdown', onPointerDown);
+            container.addEventListener('click', onClickCapture, true);
+            window.addEventListener('pointermove', onPointerMove, { passive: false });
+            window.addEventListener('pointerup', onPointerUp);
+            window.addEventListener('pointercancel', onPointerCancel);
+
+            container._pmCatDragCleanup = () => {
+                clearFrame();
+                if (drag?.ghost) drag.ghost.remove();
+                if (drag?.placeholder) drag.placeholder.remove();
+                if (drag?.item) drag.item.classList.remove('pm-cat-source');
+                drag = null;
+                suppressClick = false;
+                container.classList.remove('pm-cat-reordering');
+                getDraggableItems().forEach(el => {
+                    el.style.removeProperty('--pm-cat-jiggle-delay');
+                    el.style.transform = '';
+                    el.style.transition = '';
+                    el.classList.remove('pm-cat-shifting');
+                });
+                container.removeEventListener('pointerdown', onPointerDown);
+                container.removeEventListener('click', onClickCapture, true);
+                window.removeEventListener('pointermove', onPointerMove);
+                window.removeEventListener('pointerup', onPointerUp);
+                window.removeEventListener('pointercancel', onPointerCancel);
+            };
+        },
+
         renderList() {
             const container = document.getElementById('pm-list');
             if (!container) return;
@@ -2064,45 +2618,447 @@
             if (this._activeCategory === '常用') {
                 filtered = this._getFrequentPrompts(10);
                 filtered = PromptService.search(this._searchKeyword, filtered);
+                // Apply frequentOrder if available
+                if (this._frequentOrder.length > 0) {
+                    const orderMap = new Map(this._frequentOrder.map((id, i) => [id, i]));
+                    filtered.sort((a, b) => (orderMap.get(a.id) ?? 999) - (orderMap.get(b.id) ?? 999));
+                }
             } else {
                 filtered = PromptService.filterByCategory(this._activeCategory, this._prompts);
                 filtered = PromptService.search(this._searchKeyword, filtered);
-                filtered = PromptService.sortByRecent(filtered);
+                filtered.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
             }
-    
+
             if (filtered.length === 0) {
                 container.innerHTML = `<div class="pm-empty">${this._prompts.length === 0 ? '还没有提示词，点击下方按钮添加' : '没有匹配的提示词'}</div>`;
                 return;
             }
-    
-            container.innerHTML = filtered.map(p => `
+
+            // Split into favorites and normal groups
+            const favs = filtered.filter(p => p.favorite);
+            const normals = filtered.filter(p => !p.favorite);
+
+            const renderItem = p => `
                 <div class="pm-item" data-id="${p.id}">
-                    <div class="pm-item-title">
-                        ${p.favorite ? '<span class="pm-fav">★</span>' : ''}
-                        <span>${escHtml(p.title)}</span>
-                        <span class="pm-item-title-tags">${(p.tags || []).map(t => `<span class="pm-tag">${escHtml(t)}</span>`).join('')}</span>
-                    </div>
-                    <div class="pm-item-preview">${escHtml(p.content)}</div>
-                    <div class="pm-item-meta">
-                        ${(() => { const vars = parseTemplate(p.content); return vars.length > 0 ? `<div class="pm-item-tags">${vars.map(v => `<span class="pm-tag pm-var-tag">{${escHtml(v)}}</span>`).join('')}</div>` : ''; })()}
-                        <div class="pm-item-actions">
-                            <button class="pm-btn-fill" data-id="${p.id}" title="追加到输入框"><span class="pm-btn-ico" aria-hidden="true">⌨️</span><span class="pm-btn-label">只填</span></button>
-                            <button class="pm-btn-fill-send" data-id="${p.id}" title="填入并发送"><span class="pm-btn-ico" aria-hidden="true">📨</span><span class="pm-btn-label">填发</span></button>
-                            <button class="pm-btn-fav" data-id="${p.id}" title="${p.favorite ? '取消收藏' : '收藏'}"><span class="pm-btn-ico" aria-hidden="true">${p.favorite ? '⭐' : '☆'}</span><span class="pm-btn-label">收藏</span></button>
-                            <button class="pm-btn-edit" data-id="${p.id}" title="编辑"><span class="pm-btn-ico" aria-hidden="true">✏️</span><span class="pm-btn-label">编辑</span></button>
-                            <button class="pm-btn-del" data-id="${p.id}" title="删除"><span class="pm-btn-ico" aria-hidden="true">🗑️</span><span class="pm-btn-label">删除</span></button>
+                    <div class="pm-item-inner">
+                        <div class="pm-item-title">
+                            ${p.favorite ? '<span class="pm-fav">★</span>' : ''}
+                            <span>${escHtml(p.title)}</span>
+                            <span class="pm-item-title-tags">${(p.tags || []).map(t => `<span class="pm-tag">${escHtml(t)}</span>`).join('')}</span>
+                        </div>
+                        <div class="pm-item-preview">${escHtml(p.content)}</div>
+                        <div class="pm-item-meta">
+                            ${(() => { const vars = parseTemplate(p.content); return vars.length > 0 ? `<div class="pm-item-tags">${vars.map(v => `<span class="pm-tag pm-var-tag">{${escHtml(v)}}</span>`).join('')}</div>` : ''; })()}
+                            <div class="pm-item-actions">
+                                <button class="pm-btn-fill" data-id="${p.id}" title="追加到输入框"><span class="pm-btn-ico" aria-hidden="true">⌨️</span><span class="pm-btn-label">只填</span></button>
+                                <button class="pm-btn-fill-send" data-id="${p.id}" title="填入并发送"><span class="pm-btn-ico" aria-hidden="true">📨</span><span class="pm-btn-label">填发</span></button>
+                                <button class="pm-btn-fav" data-id="${p.id}" title="${p.favorite ? '取消收藏' : '收藏'}"><span class="pm-btn-ico" aria-hidden="true">${p.favorite ? '⭐' : '☆'}</span><span class="pm-btn-label">收藏</span></button>
+                                <button class="pm-btn-edit" data-id="${p.id}" title="编辑"><span class="pm-btn-ico" aria-hidden="true">✏️</span><span class="pm-btn-label">编辑</span></button>
+                                <button class="pm-btn-del" data-id="${p.id}" title="删除"><span class="pm-btn-ico" aria-hidden="true">🗑️</span><span class="pm-btn-label">删除</span></button>
+                            </div>
                         </div>
                     </div>
-                </div>
-            `).join('');
-    
+                </div>`;
+
+            const favHtml = favs.map(renderItem).join('');
+            const dividerHtml = favs.length > 0 && normals.length > 0
+                ? '<div class="pm-fav-divider" data-type="divider"><span>收藏</span></div>'
+                : '';
+            const normalHtml = normals.map(renderItem).join('');
+
+            container.innerHTML = favHtml + dividerHtml + normalHtml;
+
             container.querySelectorAll('.pm-btn-fill').forEach(btn => btn.addEventListener('click', e => { e.stopPropagation(); this._fillPrompt(btn.dataset.id); }));
             container.querySelectorAll('.pm-btn-fill-send').forEach(btn => btn.addEventListener('click', e => { e.stopPropagation(); this._fillAndSendPrompt(btn.dataset.id); }));
             container.querySelectorAll('.pm-btn-edit').forEach(btn => btn.addEventListener('click', e => { e.stopPropagation(); this.showEditModal(btn.dataset.id); }));
             container.querySelectorAll('.pm-btn-del').forEach(btn => btn.addEventListener('click', e => { e.stopPropagation(); this._deletePrompt(btn.dataset.id); }));
             container.querySelectorAll('.pm-btn-fav').forEach(btn => btn.addEventListener('click', e => { e.stopPropagation(); this._toggleFavorite(btn.dataset.id); }));
+            this._bindDragEvents(container);
         },
-    
+
+        _bindDragEvents(container) {
+            // Pointer-based sorting with a fixed visual clone.
+            // The original card stays out of the animated layer and is only
+            // swapped back after the ghost lands, avoiding the fixed->flow hitch.
+            if (container._pmDragCleanup) container._pmDragCleanup();
+
+            const MOVE_THRESHOLD = 6;
+            let drag = null;
+            let raf = 0;
+            let lastClientY = 0;
+
+            const clearFrame = () => {
+                if (raf) cancelAnimationFrame(raf);
+                raf = 0;
+            };
+
+            const getListItems = () => [...container.querySelectorAll('.pm-item:not(.pm-lifted):not(.pm-drag-source)')];
+            const getDivider = () => container.querySelector('.pm-fav-divider');
+
+            const setGhostTransform = (dx, dy, ghost = drag?.ghost) => {
+                if (!ghost) return;
+                ghost.style.setProperty('--pm-drag-x', `${dx}px`);
+                ghost.style.setProperty('--pm-drag-y', `${dy}px`);
+                ghost.style.setProperty('--pm-drag-rotate', `${Math.max(-0.95, Math.min(0.95, dx / 155))}deg`);
+            };
+
+            const applyJiggleDelays = () => {
+                getListItems().forEach((el, i) => {
+                    el.style.setProperty('--pm-jiggle-delay', `${-(i % 5) * 84}ms`);
+                });
+            };
+
+            const animateLayoutShift = (mutate) => {
+                const items = getListItems();
+                const first = new Map(items.map(el => [el, el.getBoundingClientRect()]));
+                mutate();
+                const shifted = [];
+                for (const el of items) {
+                    if (!el.isConnected) continue;
+                    const before = first.get(el);
+                    const after = el.getBoundingClientRect();
+                    const dx = before.left - after.left;
+                    const dy = before.top - after.top;
+                    if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) continue;
+                    el.classList.add('pm-shifting');
+                    el.style.transition = 'none';
+                    el.style.transform = `translate3d(${dx}px,${dy}px,0)`;
+                    shifted.push(el);
+                }
+                if (!shifted.length) return;
+                requestAnimationFrame(() => {
+                    shifted.forEach(el => {
+                        el.style.transition = 'transform .34s cubic-bezier(.16,1,.3,1),box-shadow .18s ease,border-color .18s ease,background .18s ease';
+                        el.style.transform = '';
+                    });
+                    setTimeout(() => {
+                        shifted.forEach(el => {
+                            el.classList.remove('pm-shifting');
+                            el.style.transition = '';
+                            el.style.transform = '';
+                        });
+                    }, 380);
+                });
+            };
+
+            const movePlaceholder = (clientY) => {
+                if (!drag?.placeholder) return;
+                const items = getListItems();
+                const divider = getDivider();
+                const beforeEl = items.find(el => {
+                    const r = el.getBoundingClientRect();
+                    return clientY < r.top + r.height / 2;
+                }) || null;
+                // Never insert before the divider (favorites stay on top)
+                if (divider && beforeEl === divider) return;
+                const currentNext = drag.placeholder.nextElementSibling;
+                if (beforeEl === currentNext || (!beforeEl && drag.placeholder === container.lastElementChild)) return;
+                animateLayoutShift(() => {
+                    if (beforeEl) container.insertBefore(drag.placeholder, beforeEl);
+                    else container.appendChild(drag.placeholder);
+                });
+            };
+
+            const autoScroll = (clientY) => {
+                const r = container.getBoundingClientRect();
+                const edge = 46;
+                if (clientY < r.top + edge) container.scrollTop -= Math.round((r.top + edge - clientY) / 4) + 4;
+                else if (clientY > r.bottom - edge) container.scrollTop += Math.round((clientY - (r.bottom - edge)) / 4) + 4;
+            };
+
+            const startDrag = (e) => {
+                const source = drag.item;
+                const rect = source.getBoundingClientRect();
+                const cs = getComputedStyle(source);
+
+                const placeholder = document.createElement('div');
+                placeholder.className = 'pm-drag-placeholder';
+                placeholder.style.height = `${rect.height}px`;
+                placeholder.style.marginBottom = cs.marginBottom;
+                source.parentNode.insertBefore(placeholder, source);
+
+                const ghost = source.cloneNode(true);
+                ghost.classList.add('pm-lifted');
+                ghost.removeAttribute('id');
+                ghost.style.left = `${rect.left}px`;
+                ghost.style.top = `${rect.top}px`;
+                ghost.style.width = `${rect.width}px`;
+                ghost.style.height = `${rect.height}px`;
+                ghost.style.transition = 'box-shadow .18s ease,border-color .18s ease,opacity .18s ease';
+                document.body.appendChild(ghost);
+
+                // Hide the real card after the placeholder is in place. The visual card
+                // is now the ghost, so release will not need to convert fixed -> normal flow.
+                source.classList.add('pm-drag-source');
+
+                drag.rect = rect;
+                drag.ghost = ghost;
+                drag.placeholder = placeholder;
+                drag.started = true;
+                drag.offsetX = e.clientX - rect.left;
+                drag.offsetY = e.clientY - rect.top;
+                lastClientY = e.clientY;
+
+                setGhostTransform(0, 0);
+                container.classList.add('pm-reordering');
+                applyJiggleDelays();
+            };
+
+            const onPointerDown = (e) => {
+                if (e.button !== undefined && e.button !== 0) return;
+                if (e.target.closest('button,input,textarea,select,a,[contenteditable="true"]')) return;
+                const item = e.target.closest('.pm-item');
+                if (!item || !container.contains(item)) return;
+                drag = {
+                    item,
+                    ghost: null,
+                    pointerId: e.pointerId,
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    rect: item.getBoundingClientRect(),
+                    started: false,
+                    placeholder: null,
+                    offsetX: 0,
+                    offsetY: 0,
+                };
+                item.setPointerCapture?.(e.pointerId);
+            };
+
+            const onPointerMove = (e) => {
+                if (!drag) return;
+                const dx = e.clientX - drag.startX;
+                const dy = e.clientY - drag.startY;
+                lastClientY = e.clientY;
+                if (!drag.started) {
+                    if (Math.hypot(dx, dy) < MOVE_THRESHOLD) return;
+                    startDrag(e);
+                }
+                e.preventDefault();
+                clearFrame();
+                raf = requestAnimationFrame(() => {
+                    setGhostTransform(dx, dy);
+                    movePlaceholder(lastClientY);
+                    autoScroll(lastClientY);
+                });
+            };
+
+            const waitForTransition = (el, propertyName, fallback = 240) => new Promise(resolve => {
+                let done = false;
+                const finish = () => {
+                    if (done) return;
+                    done = true;
+                    el.removeEventListener('transitionend', onEnd);
+                    resolve();
+                };
+                const onEnd = (ev) => {
+                    if (ev.target === el && (!propertyName || ev.propertyName === propertyName)) finish();
+                };
+                el.addEventListener('transitionend', onEnd);
+                setTimeout(finish, fallback);
+            });
+
+            const finishDrag = async (shouldSave = true) => {
+                if (!drag) return;
+                clearFrame();
+                const state = drag;
+                drag = null;
+
+                const source = state.item;
+                try { source.releasePointerCapture?.(state.pointerId); } catch(e) {}
+
+                if (!state.started) return;
+
+                const ghost = state.ghost;
+                const placeholder = state.placeholder;
+                const targetRect = placeholder.getBoundingClientRect();
+                const dx = targetRect.left - state.rect.left;
+                const dy = targetRect.top - state.rect.top;
+
+                ghost.classList.add('pm-dropping');
+                ghost.style.transition = 'transform .19s cubic-bezier(.2,.9,.2,1),box-shadow .19s ease,border-color .19s ease,opacity .16s ease';
+                setGhostTransform(dx, dy, ghost);
+
+                await waitForTransition(ghost, 'transform', 230);
+
+                // Swap the real card into the placeholder while the ghost is still above it.
+                // This makes the visual handoff effectively invisible and removes the release hitch.
+                const firstRects = new Map(getListItems().map(el => [el, el.getBoundingClientRect()]));
+                placeholder.parentNode.insertBefore(source, placeholder);
+                source.classList.remove('pm-drag-source');
+                source.classList.add('pm-drop-pop');
+                placeholder.remove();
+
+                requestAnimationFrame(() => {
+                    for (const [el, before] of firstRects) {
+                        if (!el.isConnected || el === source) continue;
+                        const after = el.getBoundingClientRect();
+                        const shiftX = before.left - after.left;
+                        const shiftY = before.top - after.top;
+                        if (Math.abs(shiftX) < .5 && Math.abs(shiftY) < .5) continue;
+                        el.style.transition = 'none';
+                        el.style.transform = `translate3d(${shiftX}px,${shiftY}px,0)`;
+                        requestAnimationFrame(() => {
+                            el.style.transition = 'transform .28s cubic-bezier(.16,1,.3,1)';
+                            el.style.transform = '';
+                        });
+                    }
+                    requestAnimationFrame(() => ghost.remove());
+                });
+
+                // Clean up after the visual handoff. Keep the jiggle for a tiny moment,
+                // so the whole group settles instead of stopping sharply on mouseup.
+                setTimeout(() => {
+                    container.classList.remove('pm-reordering');
+                    getListItems().forEach(el => {
+                        el.style.removeProperty('--pm-jiggle-delay');
+                        el.style.transform = '';
+                        el.style.transition = '';
+                        el.classList.remove('pm-shifting');
+                    });
+                }, 150);
+                setTimeout(() => source.classList.remove('pm-drop-pop'), 360);
+
+                if (shouldSave) {
+                    const newOrder = [...container.querySelectorAll('.pm-item:not(.pm-lifted):not(.pm-drag-source)')].map(el => el.dataset.id);
+                    const draggedId = source.dataset.id;
+                    const saveOrder = () => this._saveNewOrder(newOrder, draggedId, container).catch(e => log('保存排序失败:', e));
+                    if (window.requestIdleCallback) window.requestIdleCallback(saveOrder, { timeout: 1000 });
+                    else setTimeout(saveOrder, 260);
+                }
+            };
+
+            const onPointerUp = () => finishDrag(true);
+            const onPointerCancel = () => finishDrag(false);
+
+            container.addEventListener('pointerdown', onPointerDown);
+            window.addEventListener('pointermove', onPointerMove, { passive: false });
+            window.addEventListener('pointerup', onPointerUp);
+            window.addEventListener('pointercancel', onPointerCancel);
+
+            container._pmDragCleanup = () => {
+                clearFrame();
+                if (drag?.ghost) drag.ghost.remove();
+                if (drag?.placeholder) drag.placeholder.remove();
+                if (drag?.item) drag.item.classList.remove('pm-drag-source');
+                drag = null;
+                container.classList.remove('pm-reordering');
+                getListItems().forEach(el => {
+                    el.style.removeProperty('--pm-jiggle-delay');
+                    el.style.transform = '';
+                    el.style.transition = '';
+                    el.classList.remove('pm-shifting');
+                });
+                container.removeEventListener('pointerdown', onPointerDown);
+                window.removeEventListener('pointermove', onPointerMove);
+                window.removeEventListener('pointerup', onPointerUp);
+                window.removeEventListener('pointercancel', onPointerCancel);
+            };
+        },
+
+        async _saveNewOrder(newOrder, draggedId, container) {
+            if (this._activeCategory === '常用') {
+                this._frequentOrder = newOrder;
+                await StorageService.saveFrequentOrder(newOrder);
+                this.renderList();
+                return;
+            }
+
+            // Check if the dragged item crossed zones
+            const draggedPrompt = this._prompts.find(p => p.id === draggedId);
+            const crossedZone = draggedPrompt && (() => {
+                // Find where the item ended up in the DOM order
+                const domIdx = newOrder.indexOf(draggedId);
+                const favCount = newOrder.filter(id => {
+                    const p = this._prompts.find(pp => pp.id === id);
+                    return p?.favorite;
+                }).length;
+                // If favorite ended up in normal zone, or normal ended up in favorite zone
+                if (draggedPrompt.favorite && domIdx >= favCount) return true;
+                if (!draggedPrompt.favorite && domIdx < favCount) return true;
+                return false;
+            })();
+
+            // Capture position before re-render if crossing zone
+            let oldRect = null;
+            if (crossedZone && container) {
+                const el = container.querySelector(`[data-id="${draggedId}"]`);
+                if (el) oldRect = el.getBoundingClientRect();
+            }
+
+            // Separate favorites and normals
+            const favIds = [];
+            const normalIds = [];
+            for (const id of newOrder) {
+                const p = this._prompts.find(p => p.id === id);
+                if (!p) continue;
+                if (p.favorite) favIds.push(id);
+                else normalIds.push(id);
+            }
+            favIds.forEach((id, i) => {
+                const p = this._prompts.find(p => p.id === id);
+                if (p) p.sortOrder = i;
+            });
+            normalIds.forEach((id, i) => {
+                const p = this._prompts.find(p => p.id === id);
+                if (p) p.sortOrder = i + 10000;
+            });
+            await StorageService.save(this._prompts);
+            this.renderList();
+
+            // Animate the zone crossing
+            if (crossedZone && oldRect && container) {
+                const newEl = container.querySelector(`[data-id="${draggedId}"]`);
+                if (newEl) {
+                    const newRect = newEl.getBoundingClientRect();
+                    const dx = oldRect.left - newRect.left;
+                    const dy = oldRect.top - newRect.top;
+                    if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
+                        newEl.style.transition = 'none';
+                        newEl.style.transform = `translate3d(${dx}px, ${dy}px, 0)`;
+                        newEl.style.zIndex = '10';
+                        newEl.style.boxShadow = '0 8px 24px rgba(0,0,0,.15)';
+                        requestAnimationFrame(() => {
+                            newEl.style.transition = 'transform .4s cubic-bezier(.16,1,.3,1), box-shadow .4s ease';
+                            newEl.style.transform = '';
+                            newEl.style.boxShadow = '';
+                            setTimeout(() => {
+                                newEl.style.transition = '';
+                                newEl.style.transform = '';
+                                newEl.style.zIndex = '';
+                                newEl.style.boxShadow = '';
+                            }, 450);
+                        });
+                    }
+                }
+            }
+        },
+
+        async _reorderPrompts(draggedId, targetId) {
+            if (this._activeCategory === '常用') {
+                // Reorder in frequentOrder
+                const order = [...this._frequentOrder];
+                const fromIdx = order.indexOf(draggedId);
+                const toIdx = order.indexOf(targetId);
+                if (fromIdx === -1 || toIdx === -1) return;
+                order.splice(fromIdx, 1);
+                order.splice(toIdx, 0, draggedId);
+                this._frequentOrder = order;
+                await StorageService.saveFrequentOrder(order);
+            } else {
+                // Reorder within current category
+                const filtered = PromptService.filterByCategory(this._activeCategory, this._prompts);
+                filtered.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+                const fromIdx = filtered.findIndex(p => p.id === draggedId);
+                const toIdx = filtered.findIndex(p => p.id === targetId);
+                if (fromIdx === -1 || toIdx === -1) return;
+                const [moved] = filtered.splice(fromIdx, 1);
+                filtered.splice(toIdx, 0, moved);
+                filtered.forEach((p, i) => { p.sortOrder = i; });
+                await StorageService.save(this._prompts);
+            }
+            this.renderList();
+        },
+
         async _fillPrompt(id) {
             const prompt = this._prompts.find(p => p.id === id);
             if (!prompt) return;
@@ -2125,7 +3081,7 @@
                 toast('未找到输入框，请点击 ChatGPT 输入区域后再试');
             }
         },
-    
+
         async _fillAndSendPrompt(id) {
             const prompt = this._prompts.find(p => p.id === id);
             if (!prompt) return;
@@ -2151,7 +3107,7 @@
                 toast('发送按钮未就绪，请手动点击发送');
             }
         },
-    
+
         async _deletePrompt(id) {
             const prompt = this._prompts.find(p => p.id === id);
             if (!prompt) return;
@@ -2162,7 +3118,7 @@
             this.renderCategories();
             toast('已删除');
         },
-    
+
         async _toggleFavorite(id) {
             const prompt = this._prompts.find(p => p.id === id);
             if (!prompt) return;
@@ -2170,7 +3126,7 @@
             await StorageService.save(this._prompts);
             this.renderList();
         },
-    
+
         async _handleImport(e) {
             const file = e.target.files[0];
             if (!file) return;
@@ -2313,12 +3269,15 @@
             });
             overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
         },
-    
+
         showEditModal(id, prefill) {
             this._editingId = id || null;
             const prompt = id ? this._prompts.find(p => p.id === id) : null;
-            const data = prompt || prefill || {};
-    
+            const defaultCategory = (this._activeCategory !== '全部' && this._activeCategory !== '常用') ? this._activeCategory : '通用模板';
+            const data = prompt || prefill || { category: defaultCategory };
+            const modalCategories = [...new Set([...this._getCategoryList(), data.category || defaultCategory].filter(Boolean))];
+            const selectedCategory = modalCategories.includes(data.category) ? data.category : (modalCategories[0] || defaultCategory);
+
             const overlay = document.createElement('div');
             overlay.className = 'pm-modal-overlay';
             overlay.innerHTML = `
@@ -2330,9 +3289,22 @@
                     <textarea id="pm-edit-content" placeholder="输入提示词内容...">${escHtml(data.content || '')}</textarea>
                     <div style="margin:-8px 0 12px;font-size:11px;color:#9ca3af">使用 {变量名} 定义占位符，{变量名='默认值'} 设置默认值。传参：'值' 按顺序，变量名='值' 按名称，'' 跳过</div>
                     <label>分类</label>
-                    <select id="pm-edit-category">
-                        ${this._getCategoryList().map(c => `<option value="${c}"${data.category === c ? ' selected' : ''}>${c}</option>`).join('')}
+                    <select id="pm-edit-category" class="pm-select-native" aria-hidden="true" tabindex="-1">
+                        ${modalCategories.map(c => `<option value="${escAttr(c)}"${selectedCategory === c ? ' selected' : ''}>${escHtml(c)}</option>`).join('')}
                     </select>
+                    <div class="pm-select" data-for="pm-edit-category">
+                        <button type="button" class="pm-select-trigger" aria-haspopup="listbox" aria-expanded="false">
+                            <span class="pm-select-value">${escHtml(selectedCategory)}</span>
+                            <span class="pm-select-arrow" aria-hidden="true">⌄</span>
+                        </button>
+                        <div class="pm-select-menu" role="listbox" tabindex="-1">
+                            ${modalCategories.map(c => `
+                                <button type="button" class="pm-select-option${selectedCategory === c ? ' pm-selected' : ''}" role="option" aria-selected="${selectedCategory === c ? 'true' : 'false'}" data-value="${escAttr(c)}">
+                                    <span>${escHtml(c)}</span><span class="pm-select-check" aria-hidden="true">✓</span>
+                                </button>
+                            `).join('')}
+                        </div>
+                    </div>
                     <label>标签（逗号分隔）</label>
                     <input id="pm-edit-tags" type="text" value="${(data.tags || []).join(', ')}" placeholder="标签1, 标签2" />
                     <div class="pm-modal-btns">
@@ -2342,27 +3314,101 @@
                 </div>`;
             document.body.appendChild(overlay);
             setTimeout(() => document.getElementById('pm-edit-title')?.focus(), 50);
+            this._bindCategorySelect(overlay);
             overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
             document.getElementById('pm-edit-cancel').addEventListener('click', () => overlay.remove());
             document.getElementById('pm-edit-save').addEventListener('click', async () => { await this._savePrompt(overlay); });
             overlay.addEventListener('keydown', e => { if (e.ctrlKey && e.key === 'Enter') this._savePrompt(overlay); });
         },
-    
+
+        _bindCategorySelect(overlay) {
+            const select = overlay.querySelector('#pm-edit-category');
+            const wrap = overlay.querySelector('.pm-select[data-for="pm-edit-category"]');
+            if (!select || !wrap) return;
+
+            const trigger = wrap.querySelector('.pm-select-trigger');
+            const valueText = wrap.querySelector('.pm-select-value');
+            const options = [...wrap.querySelectorAll('.pm-select-option')];
+
+            const close = () => {
+                wrap.classList.remove('pm-open');
+                trigger.setAttribute('aria-expanded', 'false');
+            };
+            const open = () => {
+                wrap.classList.add('pm-open');
+                trigger.setAttribute('aria-expanded', 'true');
+            };
+            const setValue = (value) => {
+                select.value = value;
+                valueText.textContent = value;
+                options.forEach(btn => {
+                    const selected = btn.dataset.value === value;
+                    btn.classList.toggle('pm-selected', selected);
+                    btn.setAttribute('aria-selected', selected ? 'true' : 'false');
+                });
+                select.dispatchEvent(new Event('change', { bubbles: true }));
+            };
+            const focusOption = (offset) => {
+                const current = Math.max(0, options.findIndex(btn => btn.dataset.value === select.value));
+                const next = options[(current + offset + options.length) % options.length];
+                next?.focus();
+            };
+
+            trigger.addEventListener('click', e => {
+                e.stopPropagation();
+                wrap.classList.contains('pm-open') ? close() : open();
+            });
+            trigger.addEventListener('keydown', e => {
+                if (e.key === 'ArrowDown') { e.preventDefault(); open(); focusOption(0); }
+                if (e.key === 'ArrowUp') { e.preventDefault(); open(); focusOption(-1); }
+                if (e.key === 'Escape') close();
+            });
+            options.forEach(btn => {
+                btn.addEventListener('click', e => {
+                    e.stopPropagation();
+                    setValue(btn.dataset.value);
+                    close();
+                    trigger.focus();
+                });
+                btn.addEventListener('keydown', e => {
+                    const idx = options.indexOf(btn);
+                    if (e.key === 'ArrowDown') { e.preventDefault(); options[(idx + 1) % options.length]?.focus(); }
+                    if (e.key === 'ArrowUp') { e.preventDefault(); options[(idx - 1 + options.length) % options.length]?.focus(); }
+                    if (e.key === 'Home') { e.preventDefault(); options[0]?.focus(); }
+                    if (e.key === 'End') { e.preventDefault(); options[options.length - 1]?.focus(); }
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setValue(btn.dataset.value);
+                        close();
+                        trigger.focus();
+                    }
+                    if (e.key === 'Escape') {
+                        e.preventDefault();
+                        close();
+                        trigger.focus();
+                    }
+                });
+            });
+            overlay.addEventListener('click', e => { if (!wrap.contains(e.target)) close(); });
+        },
+
         async _savePrompt(overlay) {
             const title = document.getElementById('pm-edit-title').value.trim();
             const content = document.getElementById('pm-edit-content').value.trim();
             const category = document.getElementById('pm-edit-category').value;
             const tagsStr = document.getElementById('pm-edit-tags').value.trim();
             const tags = tagsStr ? tagsStr.split(/[,，]/).map(t => t.trim()).filter(Boolean) : [];
-    
+
             if (!title) { toast('请输入标题'); return; }
             if (!content) { toast('请输入提示词内容'); return; }
-    
+
             if (this._editingId) {
                 const idx = this._prompts.findIndex(p => p.id === this._editingId);
                 if (idx !== -1) this._prompts[idx] = PromptService.update(this._prompts[idx], { title, content, category, tags });
             } else {
-                this._prompts.push(PromptService.create({ title, content, category, tags }));
+                // Shift existing normal items up by 1, place new at the beginning
+                this._prompts.filter(p => !p.favorite).forEach(p => { p.sortOrder = (p.sortOrder || 10000) + 1; });
+                this._prompts.push(PromptService.create({ title, content, category, tags, sortOrder: 10000 }));
             }
             await StorageService.save(this._prompts);
             overlay.remove();
@@ -2371,7 +3417,7 @@
             toast(this._editingId ? '已更新' : '已添加');
         },
     };
-    
+
     // ============================================================
     // Section 15: SPA Monitoring
     // ============================================================
@@ -2389,7 +3435,7 @@
             }
         };
         setInterval(checkUrl, 1000);
-    
+
         let debounce = null;
         const obs = new MutationObserver(() => {
             if (debounce) clearTimeout(debounce);
@@ -2409,7 +3455,7 @@
         });
         obs.observe(document.body, { childList: true, subtree: true });
     }
-    
+
     // ============================================================
     // Section 16: Bootstrap
     // ============================================================
@@ -2422,19 +3468,19 @@
         createPanel();
         applyPanelMode();
         startMonitoring();
-    
+
         if (getConversationId()) {
             log('当前对话:', getConversationId());
             updateFab();
         }
     }
-    
+
     if (document.readyState === 'complete') boot();
     else window.addEventListener('load', boot);
-    
+
     // Menu commands
     GM_registerMenuCommand('打开提示词套件', () => togglePanel(true));
     GM_registerMenuCommand('导出提示词备份', () => { StorageService.exportJSON(LibraryUI._prompts); toast('已导出'); });
-    
+
     })();
-    
+
